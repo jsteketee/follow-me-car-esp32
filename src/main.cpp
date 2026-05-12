@@ -1,28 +1,15 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include "config.h"
+#include "utils.h"
 #include "oled.h"
 #include "imu.h"
+#include "esp_log.h"
 
-float lps = 0.0;
-float seconds = 0.0;
+static const char *TAG = "main";
 
-// Function to track the speed of the main loop.
-void updateLPS()
-{
-    static uint32_t count = 0;
-    static uint32_t lastSecond = 0;
+static HzTracker loopHz;
 
-    count++;
-    uint32_t now = millis();
-    if (now - lastSecond >= 1000) {
-        lps = count * 1000.0f / (now - lastSecond);
-        count = 0;
-        lastSecond = now;
-    }
-}
-
-// Function to report the uptime and LPS to the serial monitor
 void reportSerial()
 {
     static uint32_t lastSerialReport = 0;
@@ -30,11 +17,8 @@ void reportSerial()
         return;
     lastSerialReport = millis();
 
-    Serial.print("Uptime: ");
-    Serial.print(seconds, 2);
     Serial.print("s  LPS: ");
-    Serial.print(lps / 1000.0, 2);
-    Serial.print("K");
+    Serial.print(loopHz.hz);
     Serial.println("");
 
     const ImuData& imu = imu_get();
@@ -72,19 +56,17 @@ void setup()
 
     Serial0.begin(9600, SERIAL_8N1, PIN_UWB_LEFT_RX, PIN_UWB_LEFT_TX);
 
-    Wire.begin(PIN_SDA, PIN_SCL);
     oled_init();
     imu_init();
-    uwb_test();
-    uwb_test();
+    // uwb_test();
+
     Serial.println("Starting Main Loop...");
 }
 
 void loop()
 {
-    seconds = millis() / 1000.0;
-    updateLPS();
+    loopHz.update();
     imu_update();
     // reportSerial();
-    oled_update(seconds, lps);
+    oled_update(loopHz.hz);
 }
