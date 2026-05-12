@@ -1,7 +1,12 @@
 #include "imu.h"
 #include "config.h"
+#include "utils.h"
 #include <Adafruit_BNO08x.h>
 #include <math.h>
+#include "esp_log.h"
+
+static const char *TAG = "imu";
+static HzTracker imuHz;
 
 static Adafruit_BNO08x bno;
 static bool imu_ready = false;
@@ -23,45 +28,42 @@ static void quaternionToEuler(float qw, float qx, float qy, float qz) {
 }
 
 static void enableReports() {
-    bno.enableReport(SH2_ROTATION_VECTOR,     5000);
-    bno.enableReport(SH2_ACCELEROMETER,        5000);
-    bno.enableReport(SH2_GYROSCOPE_CALIBRATED, 5000);
+    bno.enableReport(SH2_ROTATION_VECTOR,     IMU_REPORT_INTERVAL_MS * 1000);
+    bno.enableReport(SH2_ACCELEROMETER,        IMU_REPORT_INTERVAL_MS * 1000);
+    bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_REPORT_INTERVAL_MS * 1000);
 }
 
 void imu_init() {
     if (!bno.begin_I2C(0x4B)) {
-        Serial.println("BNO085 not found");
+        ESP_LOGE(TAG, "BNO085 not found");
         return;
     }
     enableReports();
     imu_ready = true;
-    Serial.println("BNO085 ready");
+    ESP_LOGI(TAG, "BNO085 ready");
 }
 
 //Need to figure this out. 
 void imu_update() {
+    //Exit early if IMU isn't ready, or if it's not time for an update yet
     if (!imu_ready) return;
     static uint32_t lastUpdate = 0;
-    if (millis() - lastUpdate < IMU_UPDATE_INTERVAL_MS) return;
-    lastUpdate = millis();
+    uint32_t now = millis();
+    if (now - lastUpdate < IMU_POLLING_INTERVAL_MS) return;
+    lastUpdate = now;
 
-    static uint32_t callCount = 0;
-    static uint32_t lastHz = 0;
-    callCount++;
-    if (millis() - lastHz >= 1000) {
-        _data.update_hz = callCount;
-        callCount = 0;
-        lastHz = millis();
-    }
+    //Update and expose the IMU update rate tracker
+    imuHz.update();
+    _data.update_hz = (uint32_t)imuHz.hz;
 
     if (bno.wasReset()) {
-        Serial.println("BNO085 reset, re-enabling reports");
+        ESP_LOGW(TAG, "BNO085 reset, re-enabling reports");
         enableReports();
     }
 
     for (int i = 0; i < 10 && bno.getSensorEvent(&sensorValue); i++) {
         switch (sensorValue.sensorId) {
-            case SH2_ROTATION_VECTOR:
+            case SH2_ROTATION_VECTOR: {
                 quaternionToEuler(
                     sensorValue.un.rotationVector.real,
                     sensorValue.un.rotationVector.i,
@@ -69,7 +71,13 @@ void imu_update() {
                     sensorValue.un.rotationVector.k
                 );
                 _data.cal_rot = sensorValue.status & 0x03;
+                static uint32_t lastRotationUs = 0;
+                uint32_t nowUs = micros();
+                _data.latency_us = 0.9f * _data.latency_us + 0.1f * (nowUs - lastRotationUs);
+                lastRotationUs = nowUs;
+                ESP_LOGD(TAG, "latency_us:%u", (uint32_t)_data.latency_us);
                 break;
+            }
             case SH2_ACCELEROMETER:
                 _data.ax = sensorValue.un.accelerometer.x;
                 _data.ay = sensorValue.un.accelerometer.y;
@@ -83,6 +91,8 @@ void imu_update() {
                 _data.cal_gyro = sensorValue.status & 0x03;
                 break;
         }
+        if (i == 9)
+            ESP_LOGW(TAG, "IMU sensor buffer hit cap");
     }
 }
 
