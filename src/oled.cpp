@@ -3,12 +3,12 @@
 #include "config.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <math.h>
 
 static Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 static unsigned long lastDisplayUpdate = 0;
 
 void oled_init() {
-   
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         Serial.println("OLED not found");
         while (true);
@@ -17,55 +17,42 @@ void oled_init() {
     display.display();
 }
 
+static void drawHeadingArrow(float yaw) {
+    const int cx = 96, cy = 32, r = 28;
+    const int bodyLen = 18, headLen = 6, headWidth = 4;
+
+    display.drawCircle(cx, cy, r, SSD1306_WHITE);
+
+    float angle = (yaw - 90.0f) * M_PI / 180.0f;
+    float dx = cosf(angle), dy = sinf(angle);
+    float px = -dy,         py = dx;
+
+    int bx = cx + (int)(dx * bodyLen), by = cy + (int)(dy * bodyLen);
+    int tx = bx + (int)(dx * headLen), ty = by + (int)(dy * headLen);
+    int lx = bx + (int)(px * headWidth), ly = by + (int)(py * headWidth);
+    int rx = bx - (int)(px * headWidth), ry = by - (int)(py * headWidth);
+
+    display.drawLine(cx, cy, bx, by, SSD1306_WHITE);
+    display.fillTriangle(tx, ty, lx, ly, rx, ry, SSD1306_WHITE);
+    display.fillCircle(cx, cy, 2, SSD1306_WHITE);
+}
+
 void oled_update(float seconds, float lps) {
-    if (millis() - lastDisplayUpdate < 100) return;
+    if (millis() - lastDisplayUpdate < OLED_UPDATE_INTERVAL_MS) return;
     lastDisplayUpdate = millis();
 
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
 
-    display.setCursor(0, 0);
-    display.print("Uptime:  ");
-    display.print(seconds, 1);
-    display.print("s");
+    const ImuData& imu = imu_get();
 
-    display.setCursor(0, 11);
-    display.print("LPS:     ");
+    display.setCursor(0, 0);
+    display.print("LPS:");
     display.print(lps / 1000.0, 2);
     display.print("K");
 
-    const ImuData& imu = imu_get();
-
-    display.setCursor(0, 22);
-    display.print("Y:");
-    display.print(imu.yaw, 0);
-    display.print(" P:");
-    display.print(imu.pitch, 0);
-    display.print(" R:");
-    display.print(imu.roll, 0);
-
-    display.setCursor(0, 33);
-    display.print("Ax:");
-    display.print(imu.ax, 1);
-    display.print(" Ay:");
-    display.print(imu.ay, 1);
-    display.print(" Az:");
-    display.print(imu.az, 1);
-
-    display.setCursor(0, 44);
-    display.print("Gx:");
-    display.print(imu.gx, 1);
-    display.print(" Gy:");
-    display.print(imu.gy, 1);
-    display.print(" Gz:");
-    display.print(imu.gz, 1);
-
-    display.setCursor(0, 55);
-    display.print("Cal:");
-    display.print(imu.cal_rot);
-    display.print(imu.cal_gyro);
-    display.print(imu.cal_accel);
+    drawHeadingArrow(imu.yaw);
 
     display.display();
 }

@@ -25,9 +25,13 @@
 #define PIN_BUZZER 12
 
 // OLED
-#define OLED_WIDTH  128
-#define OLED_HEIGHT 64
-#define OLED_ADDR   0x3C
+#define OLED_WIDTH              128
+#define OLED_HEIGHT             64
+#define OLED_ADDR               0x3C
+#define OLED_UPDATE_INTERVAL_MS 100
 
 // IMU
-#define IMU_UPDATE_INTERVAL_MS 100
+#define IMU_UPDATE_INTERVAL_MS  100
+
+// Serial reporting
+#define SERIAL_REPORT_INTERVAL_MS 100
