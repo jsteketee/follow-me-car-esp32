@@ -45,6 +45,15 @@ void imu_update() {
     if (millis() - lastUpdate < IMU_UPDATE_INTERVAL_MS) return;
     lastUpdate = millis();
 
+    static uint32_t callCount = 0;
+    static uint32_t lastHz = 0;
+    callCount++;
+    if (millis() - lastHz >= 1000) {
+        _data.update_hz = callCount;
+        callCount = 0;
+        lastHz = millis();
+    }
+
     if (bno.wasReset()) {
         Serial.println("BNO085 reset, re-enabling reports");
         enableReports();
