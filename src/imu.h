@@ -11,6 +11,7 @@ struct ImuData {
     uint8_t  cal_accel;
     uint8_t  cal_gyro;
     uint32_t update_hz;
+    float    latency_us;
 };
 
 void            imu_init();
