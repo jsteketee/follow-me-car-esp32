@@ -1,11 +1,14 @@
 #pragma once
 
-#include "uwb.h"
+#include "nav.h"
+#include "imu.h"
 
 struct ControlOutput {
-    float throttle;
-    float steering;
+    float throttle; // -1.0 (full reverse) to 1.0 (full forward), 0.0 = neutral
+    float steering; // -1.0 (full left) to 1.0 (full right), 0.0 = center
 };
 
 void control_init();
-ControlOutput control_update(const UWBReading &reading, float heading, float speed);
+void control_apply(const ControlOutput &output);
+void control_update(const NavData &nav, const ImuData &imu);
+const ControlOutput& control_get();
