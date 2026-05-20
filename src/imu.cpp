@@ -7,34 +7,34 @@
 #include "esp_log.h"
 
 static const char *TAG = "imu";
-static HzTracker imuHz;
+static HzTracker _imuHz;
 
 static Adafruit_BNO08x bno;
 static bool imu_ready = false;
-static sh2_SensorValue_t sensorValue;
-static ImuData _data = {};
+static sh2_SensorValue_t _sensorEvent;
+static ImuData _imuData = {};
 
 static void quaternionToEuler(float qw, float qx, float qy, float qz)
 {
     float sinr = 2.0f * (qw * qx + qy * qz);
     float cosr = 1.0f - 2.0f * (qx * qx + qy * qy);
-    _data.roll = atan2f(sinr, cosr) * 180.0f / M_PI;
+    _imuData.roll = atan2f(sinr, cosr) * 180.0f / M_PI;
 
     float sinp = 2.0f * (qw * qy - qz * qx);
-    _data.pitch = (fabsf(sinp) >= 1.0f) ? copysignf(90.0f, sinp) : asinf(sinp) * 180.0f / M_PI;
+    _imuData.pitch = (fabsf(sinp) >= 1.0f) ? copysignf(90.0f, sinp) : asinf(sinp) * 180.0f / M_PI;
 
     float siny = 2.0f * (qw * qz + qx * qy);
     float cosy = 1.0f - 2.0f * (qy * qy + qz * qz);
-    _data.yaw = atan2f(siny, cosy) * 180.0f / M_PI;
-    if (_data.yaw < 0)
-        _data.yaw += 360.0f;
+    _imuData.yaw = atan2f(siny, cosy) * 180.0f / M_PI;
+    if (_imuData.yaw < 0)
+        _imuData.yaw += 360.0f;
 }
 
 static void enableReports()
 {
     bno.enableReport(SH2_ROTATION_VECTOR, IMU_REPORT_INTERVAL_MS * 1000);
-    bno.enableReport(SH2_ACCELEROMETER, IMU_REPORT_INTERVAL_MS * 1000);
-    bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_REPORT_INTERVAL_MS * 1000);
+    // bno.enableReport(SH2_ACCELEROMETER, IMU_REPORT_INTERVAL_MS * 1000);
+    // bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_REPORT_INTERVAL_MS * 1000);
 }
 
 void imu_init()
@@ -62,8 +62,8 @@ void imu_update()
     lastUpdate = now;
 
     // Update and expose the IMU update rate tracker
-    imuHz.update();
-    _data.update_hz = (uint32_t)imuHz.hz;
+    _imuHz.update();
+    _imuData.update_hz = (uint32_t)_imuHz.hz;
 
     if (bno.wasReset())
     {
@@ -72,39 +72,57 @@ void imu_update()
     }
 
     int eventsRead = 0;
-    while (eventsRead < 10 && bno.getSensorEvent(&sensorValue)) {
+    while (eventsRead < 10 && bno.getSensorEvent(&_sensorEvent)) {
         eventsRead++;
-        switch (sensorValue.sensorId) {
+        switch (_sensorEvent.sensorId) {
         case SH2_ROTATION_VECTOR: {
             quaternionToEuler(
-                sensorValue.un.rotationVector.real,
-                sensorValue.un.rotationVector.i,
-                sensorValue.un.rotationVector.j,
-                sensorValue.un.rotationVector.k);
-            _data.cal_rot = sensorValue.status & 0x03;
+                _sensorEvent.un.rotationVector.real,
+                _sensorEvent.un.rotationVector.i,
+                _sensorEvent.un.rotationVector.j,
+                _sensorEvent.un.rotationVector.k);
+            _imuData.cal_rot = _sensorEvent.status & 0x03;
             static bool headingCalLogged = false;
-            if (!headingCalLogged && _data.cal_rot == 3) {
+            if (!headingCalLogged && _imuData.cal_rot == 3) {
                 ESP_LOGI(TAG, "✅ Heading calibrated");
                 headingCalLogged = true;
             }
             static uint32_t lastRotationUs = 0;
-            uint32_t nowUs = micros();
-            _data.latency_us = 0.9f * _data.latency_us + 0.1f * (nowUs - lastRotationUs);
-            lastRotationUs = nowUs;
-            ESP_LOGD(TAG, "latency_us:%u", (uint32_t)_data.latency_us);
+            static uint32_t minIntervalUs  = UINT32_MAX;
+            static uint32_t maxIntervalUs  = 0;
+            static uint32_t lastReportMs   = 0;
+            uint32_t nowUs    = micros();
+            uint32_t interval = nowUs - lastRotationUs;
+            lastRotationUs    = nowUs;
+            if (lastRotationUs != 0) {
+                if (interval < minIntervalUs) minIntervalUs = interval;
+                if (interval > maxIntervalUs) maxIntervalUs = interval;
+            }
+            _imuData.latency_us = 0.9f * _imuData.latency_us + 0.1f * interval;
+            uint32_t nowMs = millis();
+            if (nowMs - lastReportMs >= 1000) {
+                lastReportMs = nowMs;
+                ESP_LOGI(TAG, "rotation interval: avg=%uus  min=%uus  max=%uus  jitter=%uus",
+                    (uint32_t)_imuData.latency_us,
+                    minIntervalUs == UINT32_MAX ? 0 : minIntervalUs,
+                    maxIntervalUs,
+                    maxIntervalUs - (minIntervalUs == UINT32_MAX ? 0 : minIntervalUs));
+                minIntervalUs = UINT32_MAX;
+                maxIntervalUs = 0;
+            }
             break;
         }
         case SH2_ACCELEROMETER:
-            _data.ax = sensorValue.un.accelerometer.x;
-            _data.ay = sensorValue.un.accelerometer.y;
-            _data.az = sensorValue.un.accelerometer.z;
-            _data.cal_accel = sensorValue.status & 0x03;
+            _imuData.ax = _sensorEvent.un.accelerometer.x;
+            _imuData.ay = _sensorEvent.un.accelerometer.y;
+            _imuData.az = _sensorEvent.un.accelerometer.z;
+            _imuData.cal_accel = _sensorEvent.status & 0x03;
             break;
         case SH2_GYROSCOPE_CALIBRATED:
-            _data.gx = sensorValue.un.gyroscope.x;
-            _data.gy = sensorValue.un.gyroscope.y;
-            _data.gz = sensorValue.un.gyroscope.z;
-            _data.cal_gyro = sensorValue.status & 0x03;
+            _imuData.gx = _sensorEvent.un.gyroscope.x;
+            _imuData.gy = _sensorEvent.un.gyroscope.y;
+            _imuData.gz = _sensorEvent.un.gyroscope.z;
+            _imuData.cal_gyro = _sensorEvent.status & 0x03;
             break;
         }
     }
@@ -112,4 +130,4 @@ void imu_update()
         ESP_LOGW(TAG, "⚠️ IMU sensor buffer hit cap");
 }
 
-const ImuData &imu_get() { return _data; }
+const ImuData &imu_get() { return _imuData; }

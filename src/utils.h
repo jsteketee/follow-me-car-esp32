@@ -31,6 +31,43 @@ struct PerfTracker {
     void reset() { maxUs = 0; sumUs = 0; count = 0; }
 };
 
+// Rate gate. Returns true and writes elapsed dt (seconds) when the interval has elapsed.
+// Usage: static RateGate gate{20}; float dt; if (!gate.tick(dt)) return;
+struct RateGate {
+    uint32_t intervalMs;
+    uint32_t _lastMs    = 0;
+
+    bool tick(float& dt) {
+        uint32_t now = millis();
+        if (now - _lastMs < intervalMs) return false;
+        dt = (now - _lastMs) / 1000.0f;
+        _lastMs = now;
+        return true;
+    }
+};
+
+// PID controller. Derivative is on measurement (not error) to avoid setpoint-change spikes.
+// Call reset() when re-entering active control to clear stale integrator state.
+struct PidController {
+    float kp = 0, ki = 0, kd = 0;
+    float integral   = 0;
+    float lastMeasure = 0;
+    bool  initialized = false;
+
+    float update(float setpoint, float measure, float dt) {
+        if (!initialized) { lastMeasure = measure; initialized = true; }
+        if (dt > 0.1f) dt = 0.1f;  // clamp first-tick blowup when RateGate _lastMs starts at 0
+        float error = setpoint - measure;
+        integral += error * dt;
+        integral = constrain(integral, -1.0f, 1.0f);
+        float derivative = -(measure - lastMeasure) / dt;
+        lastMeasure = measure;
+        return kp * error + ki * integral + kd * derivative;
+    }
+
+    void reset() { integral = 0; lastMeasure = 0; initialized = false; }
+};
+
 // Tracks how often update() is called and exposes the rate in hz.
 struct HzTracker {
     uint32_t count = 0;

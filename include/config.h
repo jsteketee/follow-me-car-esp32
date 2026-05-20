@@ -13,8 +13,8 @@
 #define PIN_UWB_LEFT_RX      18
 #define PIN_UWB_RIGHT_TX     38
 #define PIN_UWB_RIGHT_RX     39
-#define PIN_UWB_REAR_TX      15
-#define PIN_UWB_REAR_RX      16
+#define PIN_UWB_FRONT_TX     15
+#define PIN_UWB_FRONT_RX     16
 #define PIN_UWB_NRST         21
 
 // PWM inputs (via logic shifter)
@@ -35,9 +35,9 @@
 // WiFi
 // =============================================================================
 #include "secrets.h"
-#define WIFI_AP_SSID     "followme-car"
+#define WIFI_AP_SSID     "Follow Me"
 #define WIFI_AP_PASS     ""
-#define WIFI_HOSTNAME    "followme-car"
+#define WIFI_HOSTNAME    "Follow Me"
 #define TELNET_PORT      23
 
 // =============================================================================
@@ -49,10 +49,14 @@
 #define OLED_UPDATE_INTERVAL_MS 100
 
 // =============================================================================
+// SENSORS
+// =============================================================================
+
+// =============================================================================
 // IMU
 // =============================================================================
-#define IMU_POLLING_INTERVAL_MS  40   // How often IMU is polled
-#define IMU_REPORT_INTERVAL_MS   50   // How often IMU reports data
+#define IMU_POLLING_INTERVAL_MS  10   // How often IMU is polled
+#define IMU_REPORT_INTERVAL_MS   10   // How often IMU reports data
 
 // =============================================================================
 // UWB
@@ -77,9 +81,35 @@
 // Control
 // =============================================================================
 #define THROTTLE_SCALE      0.25f  // Max throttle (0.0–1.0)
-#define THROTTLE_Deadband   0.15f  // Minimum throttle before movement
+#define THROTTLE_Deadband   0.0f  // Minimum throttle before movement
 #define FOLLOW_DISTANCE_CM  200.0f // Distance at which throttle is 0
 #define MAX_DISTANCE_CM     700.0f // Distance at which throttle is max
+
+// =============================================================================
+// RPM
+// =============================================================================
+#define RPM_PULSES_PER_REV       2         // Hall effect pulses per motor shaft revolution
+#define RPM_SPEED_FACTOR         0.002017f // mph per motor RPM — tune until displayed speed matches a known reference
+#define RPM_STALE_MS             250       // Zero speed if no pulse received within this window
+#define RPM_KALMAN_Q             0.6f      // Process noise — how fast true speed can change per step
+#define RPM_KALMAN_R             0.3f      // Measurement noise — pulse period is clean so this is low
+#define RPM_SPIKE_REJECT_FACTOR  2.0f      // Reject pulse if instantaneous speed exceeds this multiple of current filtered speed
+#define RPM_SPIKE_MAX_STREAK     1         // Force-accept after this many consecutive rejections (prevents blocking genuine acceleration)
+
+// =============================================================================
+// Throttle PID
+// =============================================================================
+#define CONTROL_UPDATE_INTERVAL_MS  20     // PID update rate (50 Hz)
+#define THROTTLE_SMOOTH_ALPHA       0.05f  // Exponential smoothing on throttle output (0=frozen, 1=no smoothing)
+#define THROTTLE_PID_TARGET_MPH     2.0f   // target follow speed
+#define THROTTLE_PID_KP             0.3f
+#define THROTTLE_PID_KI             0.1f
+#define THROTTLE_PID_KD             0.0f
+
+#define THROTTLE_FF_K               0.0f   // Feed-forward: maps targetSpeedMph → throttle (normalized 0–1). Tune until FF alone holds ~target speed at steady state.
+#define STEERING_PID_KP             0.02f  // ≈ 1/90°: maps ±90° error to ±1.0 steering
+#define STEERING_PID_KI             0.004f
+#define STEERING_PID_KD             0.002f
 
 // =============================================================================
 // Misc

@@ -1,14 +1,11 @@
 #pragma once
 
-#include "nav.h"
-#include "imu.h"
-
 struct ControlOutput {
-    float throttle; // -1.0 (full reverse) to 1.0 (full forward), 0.0 = neutral
-    float steering; // -1.0 (full left) to 1.0 (full right), 0.0 = center
+    float throttle;     // -1.0 (full reverse) to 1.0 (full forward), 0.0 = neutral
+    float steering;     // -1.0 (full left) to 1.0 (full right), 0.0 = center
 };
 
 void control_init();
 void control_apply(const ControlOutput &output);
-void control_update(const NavData &nav, const ImuData &imu);
+void control_update();
 const ControlOutput& control_get();

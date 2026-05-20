@@ -1,4 +1,7 @@
-// Navigation layer. Trilateration from left/right UWB anchor distances to compute tag heading and distance.
+// Navigation layer.
+// 1. Consume and process sensor data
+// 2. Determine vehicle state
+// 3. Update navigation mode and targets
 #include "nav.h"
 #include "uwb.h"
 #include "config.h"
@@ -8,9 +11,10 @@
 #include "imu.h"
 
 static const char *TAG = "nav";
-static NavData _data = { NAN, NAN, 0.0f, NavState::STALE, 0 };
-static HzTracker navHz;
+static NavData _navData = { NAN, NAN, 0.0f, 0.0f, NavState::STOPPED, 0 };
+static HzTracker _navHz;
 static unsigned long lastProcessedTimestamp = 0;
+static NavState _prevState = NavState::STOPPED;
 
 // Returns angle to tag in degrees relative to car's forward axis.
 // 0° = straight ahead, positive = right, negative = left. NAN if data invalid.
@@ -49,25 +53,50 @@ static float calc_tag_heading(const UWBReading& uwb) {
     return heading;
 }
 
-static NavState navCheck(){
-    if (millis() - _data.timestamp > UWB_STALE_HEADING_MS) return NavState::STALE;
-    else return NavState::VALID;
+void nav_set_mode(NavState mode) {
+    _navData.state = mode;
 }
 
-void nav_update(const UWBReading& uwb, const ImuData& imu) {
+boolean nav_is_stale() {
+    boolean stale = false;
+    if (_navData.state == NavState::FOLLOW_ME){
+        if (millis() - _navData.timestamp > UWB_STALE_HEADING_MS) {
+            stale = true;
+        }
+        if (_navData.relativeAngle == NAN || _navData.distanceCm == NAN){
+            stale = true;
+        }
+    }
+    return stale;
+}
+
+void nav_update() {
+    const UWBReading& uwb = uwb_get();
+    const ImuData&    imu = imu_get();
+
+    
+    // Stale check runs every call so NORMAL→STALE fires even if UWB stops producing new readings
+    if (nav_is_stale()) _navData.state = NavState::STALE;
+
+    // Capture held heading on mode transitions; late-latch on first update
+    if (_navData.state != _prevState) {
+        if (_navData.state != NavState::FOLLOW_ME) _navData.headingHold = imu.yaw;
+    }
+    if (_navData.headingHold == 0.0f) _navData.headingHold = imu.yaw;
+    _prevState = _navData.state;
+
     if (uwb.timestamp == lastProcessedTimestamp) return;
 
     float heading = calc_tag_heading(uwb);
     bool valid = !isnan(heading);
-    navHz.update(valid);
-    _data.updateHz = navHz.hz;
+    _navHz.update(valid);
+    _navData.updateHz = _navHz.hz;
 
     if (valid) {
-        _data.relativeAngle = heading;
-        _data.distanceCm    = uwb.distFast;
-        _data.timestamp     = millis();
+        _navData.relativeAngle = heading;
+        _navData.distanceCm    = uwb.distFast;
+        _navData.timestamp     = millis();
     }
-    _data.state = navCheck();
 }
 
-const NavData& nav_get() { return _data; }
+const NavData& nav_get() { return _navData; }

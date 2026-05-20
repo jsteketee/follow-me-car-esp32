@@ -16,3 +16,4 @@ void            uwb_init();
 void            uwb_update();
 const UWBReading& uwb_get();
 void            uwb_run_diagnostics();
+void            uwb_passthrough_update();
