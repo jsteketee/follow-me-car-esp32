@@ -5,6 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Coding Rules
 
 - Do not remove comments that appear on their own line. These are intentional notes left by the developer.
+- Each module owns a single static state struct. Name it with an underscore prefix in lowerCamelCase after the module (e.g. `_navData`, `_uwbData`, `_imuData`, `_rpmData`) — not the generic `_data` — so the type is clear at every use site without needing to look at the declaration.
+- Never include Claude attribution in git commit messages. Do not add "Co-Authored-By" lines or any mention of Claude Code.
 
 ## Project Overview
 

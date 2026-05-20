@@ -1,5 +1,8 @@
 // SSD1306 128x64 OLED display. Renders IMU stats, nav state, throttle/steering values, and a heading arrow.
 #include "oled.h"
+#include "nav.h"
+#include "control.h"
+#include "imu.h"
 #include "config.h"
 #include "utils.h"
 #include <Adafruit_GFX.h>
@@ -9,19 +12,20 @@
 
 static const char *TAG = "oled";
 
-static Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+static Adafruit_SSD1306 _oledDisplay(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 static unsigned long lastDisplayUpdate = 0;
-static HzTracker oledHz;
+static HzTracker _oledHz;
 
 void oled_init() {
     Wire.setPins(PIN_SDA, PIN_SCL);
-    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    if (!_oledDisplay.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         ESP_LOGE(TAG, "❌ OLED not found");
         while (true);
     }
+    Wire.setClock(400000);
     ESP_LOGI(TAG, "✅ OLED ready");
-    display.clearDisplay();
-    display.display();
+    _oledDisplay.clearDisplay();
+    _oledDisplay.display();
 }
 
 static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long navTimestamp) {
@@ -29,7 +33,7 @@ static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long na
     const int bodyLen = 18, headLen = 6, headWidth = 4;
 
     // top half only: 0x1=upper-left, 0x2=upper-right
-    display.drawCircleHelper(cx, cy, r, 0x1 | 0x2, SSD1306_WHITE);
+    _oledDisplay.drawCircleHelper(cx, cy, r, 0x1 | 0x2, SSD1306_WHITE);
 
     if (isnan(tagHeading)) return;
     // 0° = straight ahead (up on screen), positive = right
@@ -43,70 +47,70 @@ static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long na
     int lx = bx + (int)(px * headWidth), ly = by + (int)(py * headWidth);
     int rx = bx - (int)(px * headWidth), ry = by - (int)(py * headWidth);
 
-    display.drawLine(sx, sy, bx, by, SSD1306_WHITE);
-    display.fillTriangle(tx, ty, lx, ly, rx, ry, SSD1306_WHITE);
+    _oledDisplay.drawLine(sx, sy, bx, by, SSD1306_WHITE);
+    _oledDisplay.fillTriangle(tx, ty, lx, ly, rx, ry, SSD1306_WHITE);
 }
 
 static void screen_1(float lps, const NavData& nav, const ControlOutput& output, const ImuData& imu) {
-    display.setTextColor(SSD1306_WHITE);
-    display.setTextSize(1);
+    _oledDisplay.setTextColor(SSD1306_WHITE);
+    _oledDisplay.setTextSize(1);
 
-    display.setCursor(0, 0);
-    display.print("LPS:");
-    display.print(lps / 1000.0, 2);
-    display.println("K");
+    _oledDisplay.setCursor(0, 0);
+    _oledDisplay.print("LPS:");
+    _oledDisplay.print(lps / 1000.0, 2);
+    _oledDisplay.println("K");
 
-    display.print("IMU:");
-    display.println(imu.update_hz);
+    _oledDisplay.print("IMU:");
+    _oledDisplay.println(imu.update_hz);
 
-    display.print("IMU LAT:");
-    display.print(imu.latency_us / 1000.0f, 0);
-    display.println();
+    _oledDisplay.print("IMU LAT:");
+    _oledDisplay.print(imu.latency_us / 1000.0f, 0);
+    _oledDisplay.println();
 
-    display.print("HDG:");
-    display.print(imu.yaw, 0);
-    display.println();
+    _oledDisplay.print("HDG:");
+    _oledDisplay.print(imu.yaw, 0);
+    _oledDisplay.println();
 
-    display.print("CAL:");
-    display.print(imu.cal_rot);
-    display.println("/3");
+    _oledDisplay.print("CAL:");
+    _oledDisplay.print(imu.cal_rot);
+    _oledDisplay.println("/3");
 
-    // display.print("TAG:");
+    // _oledDisplay.print("TAG:");
     // if (isnan(nav.relativeAngle)) {
-    //     display.println("--");
+    //     _oledDisplay.println("--");
     // } else {
-    //     display.print(nav.relativeAngle, 0);
-    //     display.println();
+    //     _oledDisplay.print(nav.relativeAngle, 0);
+    //     _oledDisplay.println();
     // }
 
-    display.print("NAV:");
-    display.print(nav.updateHz, 2);
-    display.println("hz");
+    _oledDisplay.print("NAV:");
+    _oledDisplay.print(nav.updateHz, 2);
+    _oledDisplay.println("hz");
 
     drawHeadingArrow(nav.relativeAngle, nav.distanceCm, nav.timestamp);
 
     if (!isnan(nav.distanceCm)) {
         char distBuf[8];
         snprintf(distBuf, sizeof(distBuf), "%dcm", (int)nav.distanceCm);
-        display.setTextSize(2);
+        _oledDisplay.setTextSize(2);
         int textW = strlen(distBuf) * 12;
-        display.setCursor(96 - textW / 2, 40);
-        display.print(distBuf);
-        display.setTextSize(1);
+        _oledDisplay.setCursor(96 - textW / 2, 40);
+        _oledDisplay.print(distBuf);
+        _oledDisplay.setTextSize(1);
     }
 
     // last line: nav state, throttle, steering
-    display.setCursor(0, 56);
-    display.print(nav.state == NavState::VALID ? "OK" : "XX");
-    display.print(" T:");
-    display.print(output.throttle*100, 0);
-    display.print(" S:");
-    display.print(output.steering*100, 0);
+    _oledDisplay.setCursor(0, 56);
+    _oledDisplay.print(nav.state == NavState::FOLLOW_ME ? "OK" : "XX");
+    _oledDisplay.print(" T:");
+    _oledDisplay.print(output.throttle*100, 0);
+    _oledDisplay.print(" S:");
+    _oledDisplay.print(output.steering*100, 0);
 }
 
 static void screen_2(float lps, const NavData& nav, const ControlOutput& output, const ImuData& imu) {
-    if (nav.state == NavState::VALID)
-        display.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SSD1306_WHITE);
+    if (nav.state == NavState::FOLLOW_ME)
+        _oledDisplay.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SSD1306_WHITE);
 
     const int barW = 12, barMargin = 2, barSpacing = 4;
 
@@ -114,8 +118,8 @@ static void screen_2(float lps, const NavData& nav, const ControlOutput& output,
     const int chevW = barW, chevH = 3, chevStep = 5;
     int throttleH = (int)(constrain(output.throttle / THROTTLE_SCALE, 0.0f, 1.0f) * (OLED_HEIGHT - 2));
     for (int y = OLED_HEIGHT - 1 - chevH; y >= OLED_HEIGHT - 1 - throttleH; y -= chevStep) {
-        display.drawLine(barMargin,               y + chevH, barMargin + chevW / 2, y,         SSD1306_WHITE);
-        display.drawLine(barMargin + chevW / 2,   y,         barMargin + chevW,     y + chevH, SSD1306_WHITE);
+        _oledDisplay.drawLine(barMargin,               y + chevH, barMargin + chevW / 2, y,         SSD1306_WHITE);
+        _oledDisplay.drawLine(barMargin + chevW / 2,   y,         barMargin + chevW,     y + chevH, SSD1306_WHITE);
     }
 
     // Heading age bar: fills from bottom, top = UWB_STALE_HEADING_MS
@@ -123,36 +127,39 @@ static void screen_2(float lps, const NavData& nav, const ControlOutput& output,
     unsigned long headingAge = nav.timestamp > 0 ? millis() - nav.timestamp : UWB_STALE_HEADING_MS;
     int ageBarH = constrain((int)((long)headingAge * (OLED_HEIGHT - 2) / UWB_STALE_HEADING_MS), 0, OLED_HEIGHT - 2);
     if (ageBarH > 0)
-        display.fillRect(ageBarX, OLED_HEIGHT - 1 - ageBarH, barW, ageBarH, SSD1306_WHITE);
+        _oledDisplay.fillRect(ageBarX, OLED_HEIGHT - 1 - ageBarH, barW, ageBarH, SSD1306_WHITE);
 
     // Compass calibration — centered in gap between bars and circle (x=30..68)
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(40, 24);
-    display.print("CAL");
-    display.setCursor(40, 33);
-    display.print(imu.cal_rot);
-    display.print("/3");
+    _oledDisplay.setTextSize(1);
+    _oledDisplay.setTextColor(SSD1306_WHITE);
+    _oledDisplay.setCursor(40, 24);
+    _oledDisplay.print("CAL");
+    _oledDisplay.setCursor(40, 33);
+    _oledDisplay.print(imu.cal_rot);
+    _oledDisplay.print("/3");
 
     drawHeadingArrow(nav.relativeAngle, nav.distanceCm, nav.timestamp);
 
-    display.setTextSize(2);
-    display.setTextColor(SSD1306_WHITE);
+    _oledDisplay.setTextSize(2);
+    _oledDisplay.setTextColor(SSD1306_WHITE);
     if (!isnan(nav.distanceCm) && nav.distanceCm >= 0) {
         char distBuf[8];
         snprintf(distBuf, sizeof(distBuf), "%dcm", (int)nav.distanceCm);
         int textW = strlen(distBuf) * 12;
-        display.setCursor(96 - textW / 2, 38);
-        display.print(distBuf);
+        _oledDisplay.setCursor(96 - textW / 2, 38);
+        _oledDisplay.print(distBuf);
     }
 }
 
-void oled_update(float lps, const NavData& nav, const ControlOutput& output, const ImuData& imu) {
+void oled_update(float lps) {
+    const NavData&       nav    = nav_get();
+    const ControlOutput& output = control_get();
+    const ImuData&       imu    = imu_get();
     if (millis() - lastDisplayUpdate < OLED_UPDATE_INTERVAL_MS) return;
     lastDisplayUpdate = millis();
-    oledHz.update();
+    _oledHz.update();
 
-    display.clearDisplay();
+    _oledDisplay.clearDisplay();
     screen_2(lps, nav, output, imu);
-    display.display();
+    _oledDisplay.display();
 }
