@@ -89,7 +89,7 @@ static void screen_1(float lps, const NavData& nav, const ControlOutput& output,
 
     drawHeadingArrow(nav.relativeAngle, nav.distanceCm, nav.timestamp);
 
-    if (!isnan(nav.distanceCm)) {
+    if (nav.distanceCm >= 0) {
         char distBuf[8];
         snprintf(distBuf, sizeof(distBuf), "%dcm", (int)nav.distanceCm);
         _oledDisplay.setTextSize(2);
@@ -101,7 +101,7 @@ static void screen_1(float lps, const NavData& nav, const ControlOutput& output,
 
     // last line: nav state, throttle, steering
     _oledDisplay.setCursor(0, 56);
-    _oledDisplay.print(nav.state == NavState::FOLLOW_ME ? "OK" : "XX");
+    _oledDisplay.print(nav.mode == NavMode::FOLLOW_ME ? "OK" : "XX");
     _oledDisplay.print(" T:");
     _oledDisplay.print(output.throttle*100, 0);
     _oledDisplay.print(" S:");
@@ -109,7 +109,7 @@ static void screen_1(float lps, const NavData& nav, const ControlOutput& output,
 }
 
 static void screen_2(float lps, const NavData& nav, const ControlOutput& output, const ImuData& imu) {
-    if (nav.state == NavState::FOLLOW_ME)
+    if (nav.mode == NavMode::FOLLOW_ME)
         _oledDisplay.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SSD1306_WHITE);
 
     const int barW = 12, barMargin = 2, barSpacing = 4;

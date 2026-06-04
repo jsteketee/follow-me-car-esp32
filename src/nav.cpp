@@ -11,20 +11,20 @@
 #include "imu.h"
 
 static const char *TAG = "nav";
-static NavData _navData = { NAN, NAN, 0.0f, 0.0f, NavState::STOPPED, 0 };
+static NavData _navData = { 0.0f, -1.0f, 0.0f, 0.0f, DEFAULT_NAV_MODE, 0 };
 static HzTracker _navHz;
 static unsigned long lastProcessedTimestamp = 0;
-static NavState _prevState = NavState::STOPPED;
+static NavMode _prevState = NavMode::STOPPED;
 
 // Returns angle to tag in degrees relative to car's forward axis.
 // 0° = straight ahead, positive = right, negative = left. NAN if data invalid.
 static float calc_tag_heading(const UWBReading& uwb) {
     bool newReading = uwb.timestamp != lastProcessedTimestamp;
 
-    if (!uwb.validLeft || !uwb.validRight) {
+    if (uwb.distLeft < 0 || uwb.distRight < 0) {
         if (newReading) {
             lastProcessedTimestamp = uwb.timestamp;
-            ESP_LOGW(TAG, "⚠️ invalid UWB reading (validLeft=%d validRight=%d)", uwb.validLeft, uwb.validRight);
+            ESP_LOGW(TAG, "⚠️ invalid UWB reading (dL=%.0f dR=%.0f)", uwb.distLeft, uwb.distRight);
         }
         return NAN;
     }
@@ -45,45 +45,81 @@ static float calc_tag_heading(const UWBReading& uwb) {
     }
 
     lastProcessedTimestamp = uwb.timestamp;
-    float y       = sqrtf(ySquared);
+    float y = sqrtf(ySquared);
+
+    // Front/back disambiguation latch. Updated when distFront is valid; held on dropout.
+    // Abrupt flips (heading change > UWB_FRONT_FLIP_ABRUPT_DEG) require UWB_FRONT_FLIP_CONFIRM
+    // consecutive readings before the latch flips. Any agreeing reading resets the streak.
+    static bool tagIsBehind = false;
+    static int  flipStreak  = 0;
+    if (uwb.distFront > 0) {
+        float dx            = x - UWB_FRONT_X_CM;
+        float distIfForward = sqrtf(dx*dx + (y - UWB_FRONT_Y_CM)*(y - UWB_FRONT_Y_CM));
+        float distIfBehind  = sqrtf(dx*dx + (y + UWB_FRONT_Y_CM)*(y + UWB_FRONT_Y_CM));
+        bool behind = fabsf(uwb.distFront - distIfBehind) < fabsf(uwb.distFront - distIfForward);
+        if (behind != tagIsBehind) {
+            float h1 = atan2f(x,  y) * 180.0f / M_PI;
+            float h2 = atan2f(x, -y) * 180.0f / M_PI;
+            float delta = fabsf(h1 - h2);
+            if (delta > 180.0f) delta = 360.0f - delta;
+            bool abrupt = delta > UWB_FRONT_FLIP_ABRUPT_DEG;
+            if (!abrupt || ++flipStreak >= UWB_FRONT_FLIP_CONFIRM) {
+                ESP_LOGI(TAG, "↕ tag side: %s → %s  (distFront=%.0f fwd_exp=%.0f beh_exp=%.0f  delta=%.0f° streak=%d)",
+                         tagIsBehind ? "behind" : "front", behind ? "behind" : "front",
+                         uwb.distFront, distIfForward, distIfBehind, delta, flipStreak);
+                tagIsBehind = behind;
+                flipStreak  = 0;
+            } else {
+                ESP_LOGD(TAG, "⟳ side flip deferred: delta=%.0f° streak=%d/%d  (distFront=%.0f)",
+                         delta, flipStreak, UWB_FRONT_FLIP_CONFIRM, uwb.distFront);
+            }
+        } else {
+            flipStreak = 0;
+        }
+    }
+    if (tagIsBehind) y = -y;
+
     float heading = atan2f(x, y) * 180.0f / M_PI;
-    if (newReading){
-        ESP_LOGI(TAG, "✅ heading=%.1f°  dL=%.0f dR=%.0f", heading, dL, dR);
+    if (newReading) {
+        ESP_LOGI(TAG, "✅ heading=%.1f°  dL=%.0f dR=%.0f  side=%s", heading, dL, dR, tagIsBehind ? "behind" : "front");
     }
     return heading;
 }
 
-void nav_set_mode(NavState mode) {
-    _navData.state = mode;
+static const char* nav_mode_str(NavMode m) {
+    switch (m) {
+        case NavMode::FOLLOW_ME: return "FOLLOW_ME";
+        case NavMode::STALE:     return "STALE";
+        case NavMode::TEST:      return "TEST";
+        case NavMode::STOPPED:   return "STOPPED";
+        default:                 return "UNKNOWN";
+    }
 }
 
-boolean nav_is_stale() {
-    boolean stale = false;
-    if (_navData.state == NavState::FOLLOW_ME){
-        if (millis() - _navData.timestamp > UWB_STALE_HEADING_MS) {
-            stale = true;
-        }
-        if (_navData.relativeAngle == NAN || _navData.distanceCm == NAN){
-            stale = true;
-        }
-    }
-    return stale;
+void nav_set_mode(NavMode mode) {
+    _navData.mode = mode;
 }
+
+
 
 void nav_update() {
     const UWBReading& uwb = uwb_get();
     const ImuData&    imu = imu_get();
 
-    
-    // Stale check runs every call so NORMAL→STALE fires even if UWB stops producing new readings
-    if (nav_is_stale()) _navData.state = NavState::STALE;
+    // Guard on _navData.timestamp > 0 so startup doesn't immediately trip STALE before the first heading arrives.
+    if ((_navData.mode == NavMode::FOLLOW_ME || _navData.mode == NavMode::STALE)) {
+        bool stale = millis() - _navData.timestamp > FIX_TIMEOUT_MS;
+        if      (stale  && _navData.mode == NavMode::FOLLOW_ME) _navData.mode = NavMode::STALE;
+        else if (!stale && _navData.mode == NavMode::STALE)     _navData.mode = NavMode::FOLLOW_ME;
+    }
 
-    // Capture held heading on mode transitions; late-latch on first update
-    if (_navData.state != _prevState) {
-        if (_navData.state != NavState::FOLLOW_ME) _navData.headingHold = imu.yaw;
+    // Capture held heading on mode transitions or on first run when heading hold is uninitialized.
+    if (_navData.mode != _prevState) {
+        ESP_LOGW(TAG, "🔀 nav mode: %s → %s", nav_mode_str(_prevState), nav_mode_str(_navData.mode));
+        if (_navData.mode != NavMode::FOLLOW_ME) _navData.headingHold = imu.yaw;
     }
     if (_navData.headingHold == 0.0f) _navData.headingHold = imu.yaw;
-    _prevState = _navData.state;
+    _prevState = _navData.mode;
 
     if (uwb.timestamp == lastProcessedTimestamp) return;
 

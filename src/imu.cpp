@@ -93,12 +93,12 @@ void imu_update()
             static uint32_t lastReportMs   = 0;
             uint32_t nowUs    = micros();
             uint32_t interval = nowUs - lastRotationUs;
-            lastRotationUs    = nowUs;
             if (lastRotationUs != 0) {
                 if (interval < minIntervalUs) minIntervalUs = interval;
                 if (interval > maxIntervalUs) maxIntervalUs = interval;
+                _imuData.latency_us = 0.9f * _imuData.latency_us + 0.1f * interval;
             }
-            _imuData.latency_us = 0.9f * _imuData.latency_us + 0.1f * interval;
+            lastRotationUs = nowUs;
             uint32_t nowMs = millis();
             if (nowMs - lastReportMs >= 1000) {
                 lastReportMs = nowMs;

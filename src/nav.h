@@ -1,10 +1,9 @@
 #pragma once
 
-enum class NavState {
+enum class NavMode {
     FOLLOW_ME,
     STALE,             // no new UWB data within expected interval
     TEST,
-    WAYPOINT,
     STOPPED,
 };
 
@@ -13,10 +12,10 @@ struct NavData {
     float         distanceCm;    // straight-line distance from anchor midpoint to tag
     float         headingHold;   // absolute IMU yaw captured when entering a non-NORMAL mode
     float         updateHz;      // rolling average update rate
-    NavState      state;
+    NavMode      mode;
     unsigned long timestamp;
 };
 
 void            nav_update();
 const NavData&  nav_get();
-void            nav_set_mode(NavState mode);
+void            nav_set_mode(NavMode mode);
