@@ -121,7 +121,6 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
     <h2>Drive Mode</h2>
     <div style="display:flex;gap:8px">
       <button class="btn" id="btn-FOLLOW_ME" onclick="setMode('FOLLOW_ME')">Follow Me</button>
-      <button class="btn" id="btn-WAYPOINT"  onclick="setMode('WAYPOINT')">Waypoint</button>
       <button class="btn" id="btn-TEST"      onclick="setMode('TEST')">Test</button>
       <button class="btn" id="btn-STOPPED"   onclick="setMode('STOPPED')">Stopped</button>
     </div>
@@ -166,7 +165,7 @@ const legendBounds  = [];
 
 function render(d) {
   const valid = d.navState === 'FOLLOW_ME';
-  ['FOLLOW_ME','WAYPOINT','TEST','STOPPED'].forEach(m => {
+  ['FOLLOW_ME','TEST','STOPPED'].forEach(m => {
     const b = document.getElementById('btn-' + m);
     if (b) b.className = 'btn' + (d.navState === m ? ' active' : '');
   });
@@ -468,10 +467,9 @@ void dashboard_init() {
     _server.on("/mode", HTTP_POST, [](AsyncWebServerRequest* req) {
         if (req->hasParam("mode")) {
             String m = req->getParam("mode")->value();
-            if      (m == "FOLLOW_ME") nav_set_mode(NavState::FOLLOW_ME);
-            else if (m == "WAYPOINT")  nav_set_mode(NavState::WAYPOINT);
-            else if (m == "TEST")    nav_set_mode(NavState::TEST);
-            else if (m == "STOPPED") nav_set_mode(NavState::STOPPED);
+            if      (m == "FOLLOW_ME") nav_set_mode(NavMode::FOLLOW_ME);
+            else if (m == "TEST")    nav_set_mode(NavMode::TEST);
+            else if (m == "STOPPED") nav_set_mode(NavMode::STOPPED);
             ESP_LOGI(TAG, "mode → %s", m.c_str());
         }
         req->send(200);
@@ -512,10 +510,9 @@ void dashboard_update(float lps) {
         "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,\"na\":%u,\"nm\":%u,"
         "\"ca\":%u,\"cm\":%u,\"oa\":%u,\"om\":%u,\"wa\":%u,\"wm\":%u}}",
         safeF(nav.distanceCm), safeF(nav.relativeAngle), safeF(nav.headingHold),
-        nav.state == NavState::FOLLOW_ME  ? "FOLLOW_ME" :
-        nav.state == NavState::TEST    ? "TEST"    :
-        nav.state == NavState::WAYPOINT  ? "WAYPOINT" :
-        nav.state == NavState::STOPPED ? "STOPPED" : "STALE",
+        nav.mode == NavMode::FOLLOW_ME  ? "FOLLOW_ME" :
+        nav.mode == NavMode::TEST    ? "TEST"    :
+        nav.mode == NavMode::STOPPED ? "STOPPED" : "STALE",
         safeF(rpm.odometryCm),
         safeF(rpm.speedMph), safeF(rpm.rpm),
         safeF(imu.yaw), imu.cal_rot, imu.cal_accel,

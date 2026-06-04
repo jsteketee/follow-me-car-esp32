@@ -1,13 +1,11 @@
-// UWB ranging driver for two RYUW122 anchors. Polls via raw AT commands (library ranging is broken),
-// applies per-anchor Kalman filtering, and exposes distLeft/distRight (filtered) and distFast (raw avg).
-//TODO: Rerwite to get rid of library calls.
+// UWB ranging driver for RYUW122 anchors. All communication uses raw AT commands.
+// Per-anchor Kalman filtering and outlier rejection; exposes distLeft/distRight (filtered) and distFast (raw avg).
 
 #include "uwb.h"
 #include "config.h"
 #include "utils.h"
 #include "wifi_config.h"
 #include "esp_log.h"
-#include <RYUW122.h>
 #include <math.h>
 
 static const char *TAG = "uwb";
@@ -15,85 +13,77 @@ static const char *TAG = "uwb";
 static HardwareSerial uartFront(0);
 
 enum class PollState  { IDLE, AWAITING };
-enum class CyclePhase { WAIT, LEFT_PENDING, RIGHT_PENDING };
+enum class CyclePhase { WAIT, LEFT_PENDING, RIGHT_PENDING, FRONT_PENDING };
 
 struct UWBAnchor {
     const char*     position;
     char            moduleName[16] = {};
     HardwareSerial& serial;
-    PollState    pollState = PollState::IDLE;
-    uint32_t     sentAt    = 0;
-    char         buf[128]  = {};
-    int          bufPos    = 0;
-    KalmanFilter kalman    = {};
-    float        rawDist   = -1.0f;
+    int             pinTx;
+    int             pinRx;
+    PollState    pollState    = PollState::IDLE;
+    uint32_t     sentAt       = 0;
+    char         buf[128]     = {};
+    int          bufPos       = 0;
+    KalmanFilter kalman       = {};
+    float        rawDist      = -1.0f;
     float        prevDist     = -1.0f; // last accepted distance, -1 = no baseline yet
     int          rejectStreak = 0;     // consecutive outlier rejections
 };
 
 static UWBReading _uwbData = {};
 
-// These are the anchors we will actually use for ranging calls. 
-static UWBAnchor anchorLeft  { "left",  {}, Serial1  };
-static UWBAnchor anchorRight { "right", {}, Serial2  };
-static UWBAnchor anchorFront { "front", {}, uartFront };
+static UWBAnchor anchorLeft  { "left",  {}, Serial1,   PIN_UWB_LEFT_TX,  PIN_UWB_LEFT_RX  };
+static UWBAnchor anchorRight { "right", {}, Serial2,   PIN_UWB_RIGHT_TX, PIN_UWB_RIGHT_RX };
+static UWBAnchor anchorFront { "front", {}, uartFront, PIN_UWB_FRONT_TX, PIN_UWB_FRONT_RX };
 
-//These are objects from the RYUW122 library, however, library funct. for ranging is broken. 
-//Used to initialize and test the anchors, but not for actual ranging.
-static RYUW122 uwb_left (PIN_UWB_LEFT_TX,  PIN_UWB_LEFT_RX,  &Serial1,  PIN_UWB_NRST);
-static RYUW122 uwb_right(PIN_UWB_RIGHT_TX, PIN_UWB_RIGHT_RX, &Serial2,  PIN_UWB_NRST);
-static RYUW122 uwb_front(PIN_UWB_FRONT_TX, PIN_UWB_FRONT_RX, &uartFront, PIN_UWB_NRST);
+// --- AT command helpers (blocking, init/cal use only) ------------------------
 
-
-static void uwb_check_config(RYUW122& uwb) {
-    char addr[9] = {0};
-    uwb.getAddress(addr);
-    ESP_LOGI(TAG, "Address:    %s", addr);
-
-    char netId[9] = {0};
-    uwb.getNetworkId(netId);
-    ESP_LOGI(TAG, "Network ID: %s", netId);
-
-    char uid[32] = {0};
-    uwb.getUid(uid);
-    ESP_LOGI(TAG, "UID:        %s", uid);
-
-    RYUW122Mode mode = uwb.getMode();
-    ESP_LOGI(TAG, "Mode:       %s", RYUW122Mode_description(mode).c_str());
-
-    RYUW122BaudRate baud = uwb.getBaudRate();
-    ESP_LOGI(TAG, "Baud:       %s", RYUW122BaudRate_description(baud).c_str());
-
-    RYUW122RFChannel ch = uwb.getRfChannel();
-    ESP_LOGI(TAG, "RF Channel: %s", RYUW122RFChannel_description(ch).c_str());
-
-    RYUW122Bandwidth bw = uwb.getBandwidth();
-    ESP_LOGI(TAG, "Bandwidth:  %s", RYUW122Bandwidth_description(bw).c_str());
-
-    RYUW122RFPower pwr = uwb.getRfPower();
-    ESP_LOGI(TAG, "RF Power:   %s", RYUW122RFPower_description(pwr).c_str());
-
-    char fw[32] = {0};
-    uwb.getFirmwareVersion(fw);
-    ESP_LOGI(TAG, "Firmware:   %s", fw);
-
-    int cal = uwb.getDistanceCalibration();
-    ESP_LOGI(TAG, "Cal offset: %d cm", cal);
-}
-static bool uwb_read_address(UWBAnchor& anchor, char* out, size_t outLen);
-
-static bool uwb_init_anchor(RYUW122& uwb, UWBAnchor& anchor) {
-    uwb.begin();
-    bool ok = uwb.test();
-    uwb_read_address(anchor, anchor.moduleName, sizeof(anchor.moduleName));
-    if (ok) {
-        ESP_LOGI(TAG, "✅ [%s/%s] ready", anchor.position, anchor.moduleName);
-        // uwb_check_config(uwb);
-    } else {
-        ESP_LOGE(TAG, "❌ [%s/%s] not responding", anchor.position, anchor.moduleName);
+// Sends a query command and copies the value that follows prefix into out.
+static bool uwb_at_query(UWBAnchor& anchor, const char* cmd, const char* prefix, char* out, size_t outLen) {
+    while (anchor.serial.available()) anchor.serial.read();
+    anchor.serial.print(cmd); anchor.serial.print("\r\n");
+    uint32_t sentAt = millis();
+    char buf[64]; int pos = 0; buf[0] = '\0';
+    while (millis() - sentAt < UWB_RESPONSE_TIMEOUT_MS) {
+        while (anchor.serial.available() && pos < 63) {
+            char c = anchor.serial.read();
+            if (c == '\n') {
+                buf[pos] = '\0';
+                const char* p = strstr(buf, prefix);
+                if (p) {
+                    strncpy(out, p + strlen(prefix), outLen - 1);
+                    out[outLen - 1] = '\0';
+                    return true;
+                }
+                pos = 0;
+            } else if (c != '\r') buf[pos++] = c;
+        }
     }
-    return ok;
+    return false;
 }
+
+// Sends a command and returns true if any response line contains expected.
+static bool uwb_at_send(UWBAnchor& anchor, const char* cmd, const char* expected) {
+    char discard[2];
+    return uwb_at_query(anchor, cmd, expected, discard, sizeof(discard));
+}
+
+// --- Calibration -------------------------------------------------------------
+
+static int uwb_get_cal(UWBAnchor& anchor) {
+    char val[16] = {};
+    if (!uwb_at_query(anchor, "AT+CAL?", "+CAL=", val, sizeof(val))) return 0;
+    return atoi(val);
+}
+
+static bool uwb_set_cal(UWBAnchor& anchor, int cal) {
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "AT+CAL=%d", cal);
+    return uwb_at_send(anchor, cmd, "+OK");
+}
+
+// --- Init / diagnostics ------------------------------------------------------
 
 // Parses a +ANCHOR_RCV= response line and returns the distance field in cm, or -1.
 static int parse_anchor_rcv(const char* buf) {
@@ -104,7 +94,7 @@ static int parse_anchor_rcv(const char* buf) {
     return p ? atoi(p) : -1;
 }
 
-// Blocking single poll — used only at init time for calibration.
+// Blocking single poll — used only at init time for calibration/diagnostics.
 // Returns distance in cm, or -1 on timeout.
 static int uwb_poll_blocking(UWBAnchor& anchor) {
     while (anchor.serial.available()) anchor.serial.read();
@@ -130,33 +120,26 @@ static int uwb_poll_blocking(UWBAnchor& anchor) {
     return -1;
 }
 
-// Queries the module address via AT+ADDRESS? Returns true if successful.
-static bool uwb_read_address(UWBAnchor& anchor, char* out, size_t outLen) {
-    while (anchor.serial.available()) anchor.serial.read();
-    anchor.serial.print("AT+ADDRESS?\r\n");
+static bool uwb_init_anchor(UWBAnchor& anchor) {
+    anchor.serial.begin(115200, SERIAL_8N1, anchor.pinRx, anchor.pinTx);
 
-    uint32_t sentAt = millis();
-    char buf[64]; int pos = 0; buf[0] = '\0';
-
-    while (millis() - sentAt < UWB_RESPONSE_TIMEOUT_MS) {
-        while (anchor.serial.available() && pos < 63) {
-            char c = anchor.serial.read();
-            if (c == '\n') {
-                buf[pos] = '\0';
-                const char* prefix = "+ADDRESS=";
-                char* p = strstr(buf, prefix);
-                if (p) {
-                    strncpy(out, p + strlen(prefix), outLen - 1);
-                    out[outLen - 1] = '\0';
-                    return true;
-                }
-                pos = 0;
-            } else if (c != '\r') {
-                buf[pos++] = c;
-            }
-        }
+    // Reset after serial is ready, then drain until 200ms of idle (matches original library sequence)
+    digitalWrite(PIN_UWB_NRST, LOW);  delay(5);
+    digitalWrite(PIN_UWB_NRST, HIGH);
+    uint32_t idleStart = millis();
+    while (millis() - idleStart < 200) {
+        if (anchor.serial.available()) { anchor.serial.read(); idleStart = millis(); }
     }
-    return false;
+
+    uwb_at_query(anchor, "AT+ADDRESS?", "+ADDRESS=", anchor.moduleName, sizeof(anchor.moduleName));
+
+    bool ok = uwb_at_send(anchor, "AT", "+OK");
+    if (ok) {
+        ESP_LOGI(TAG, "✅ [%s/%s] ready", anchor.position, anchor.moduleName);
+    } else {
+        ESP_LOGE(TAG, "❌ [%s/%s] not responding", anchor.position, anchor.moduleName);
+    }
+    return ok;
 }
 
 static void uwb_test_anchor(UWBAnchor& anchor, uint32_t durationMs) {
@@ -194,17 +177,17 @@ void uwb_run_diagnostics() {
     ESP_LOGI(TAG, "=== UWB Diagnostics Complete ===");
 }
 
-static void uwb_calibrate_anchor(RYUW122& uwb, UWBAnchor& anchor, float knownDistCm, int numSamples) {
+static void uwb_calibrate_anchor(UWBAnchor& anchor, float knownDistCm, int numSamples) {
     if (uwb_poll_blocking(anchor) < 0) {
         ESP_LOGW(TAG, "⚠️ [%s/%s] calibration skipped — tag not found", anchor.position, anchor.moduleName);
         return;
     }
 
-    int existingCal = uwb.getDistanceCalibration();
-    int samples[numSamples];
+    int existingCal = uwb_get_cal(anchor);
+    int samples[UWB_CALIBRATION_SAMPLES];
     int count = 0;
 
-    for (int i = 0; i < numSamples; i++) {
+    for (int i = 0; i < numSamples && count < UWB_CALIBRATION_SAMPLES; i++) {
         int d = uwb_poll_blocking(anchor);
         if (d >= 0) samples[count++] = d;
         // Match normal poll interval so TWR conditions match steady-state operation.
@@ -242,18 +225,35 @@ static void uwb_calibrate_anchor(RYUW122& uwb, UWBAnchor& anchor, float knownDis
     ESP_LOGI(TAG, "✅ [%s/%s] calibration: %d/%d samples kept, mean=%.1f, known=%.1f, error=%d cm, cal %d→%d",
              anchor.position, anchor.moduleName, filteredCount, count, filteredMean, knownDistCm, error, existingCal, newCal);
 
-    uwb.setDistanceCalibration(newCal);
+    uwb_set_cal(anchor, newCal);
 }
 
 void uwb_init() {
-    uwb_init_anchor(uwb_left,  anchorLeft);
-    uwb_init_anchor(uwb_right, anchorRight);
-    uwb_init_anchor(uwb_front, anchorFront);
+    pinMode(PIN_UWB_NRST, OUTPUT);
+
+    uwb_init_anchor(anchorLeft);
+    uwb_init_anchor(anchorRight);
+    uwb_init_anchor(anchorFront);
     if (UWB_CALIBRATE_ON_STARTUP) {
-        uwb_calibrate_anchor(uwb_left,  anchorLeft,  UWB_CALIBRATION_DISTANCE_CM, UWB_CALIBRATION_SAMPLES);
-        uwb_calibrate_anchor(uwb_right, anchorRight, UWB_CALIBRATION_DISTANCE_CM, UWB_CALIBRATION_SAMPLES);
+        // Tag is assumed on the car centerline at UWB_CALIBRATION_DISTANCE_CM forward of the left/right anchor line.
+        // Front anchor's known distance is computed from its offset position to that tag location.
+        float frontCalDist = sqrtf(UWB_FRONT_X_CM * UWB_FRONT_X_CM +
+                                   (UWB_CALIBRATION_DISTANCE_CM - UWB_FRONT_Y_CM) *
+                                   (UWB_CALIBRATION_DISTANCE_CM - UWB_FRONT_Y_CM));
+        uwb_calibrate_anchor(anchorLeft,  UWB_CALIBRATION_DISTANCE_CM, UWB_CALIBRATION_SAMPLES);
+        uwb_calibrate_anchor(anchorRight, UWB_CALIBRATION_DISTANCE_CM, UWB_CALIBRATION_SAMPLES);
+        uwb_calibrate_anchor(anchorFront, frontCalDist,                 UWB_CALIBRATION_SAMPLES);
     }
 }
+
+// Writes a ranging result into _uwbData for whichever anchor this is. Negative = invalid.
+static void uwb_write_dist(UWBAnchor& anchor, float dist) {
+    if      (&anchor == &anchorLeft)  _uwbData.distLeft  = dist;
+    else if (&anchor == &anchorRight) _uwbData.distRight = dist;
+    else                              _uwbData.distFront = dist;
+}
+
+// --- Non-blocking ranging loop -----------------------------------------------
 
 static void uwb_start_poll(UWBAnchor& anchor) {
     while (anchor.serial.available()) anchor.serial.read();
@@ -296,11 +296,7 @@ static void uwb_update_anchor(UWBAnchor& anchor) {
                 anchor.rawDist = valid ? (float)dist : anchor.rawDist;
                 float filtered = valid ? anchor.kalman.update((float)dist, UWB_KALMAN_Q, UWB_KALMAN_R) : anchor.kalman.x;
                 ESP_LOGD(TAG, "✅ [%s/%s] raw=%d filtered=%.1f cm  latency=%ums", anchor.position, anchor.moduleName, dist, filtered, latency);
-                if (&anchor == &anchorLeft) {
-                    _uwbData.distLeft  = filtered; _uwbData.validLeft  = valid;
-                } else {
-                    _uwbData.distRight = filtered; _uwbData.validRight = valid;
-                }
+                uwb_write_dist(anchor, valid ? filtered : -1.0f);
                 anchor.pollState = PollState::IDLE;
                 return;
             }
@@ -312,11 +308,7 @@ static void uwb_update_anchor(UWBAnchor& anchor) {
 
     if (millis() - anchor.sentAt >= UWB_RESPONSE_TIMEOUT_MS) {
         ESP_LOGW(TAG, "⚠️ [%s/%s] no response  latency=%ums", anchor.position, anchor.moduleName, millis() - anchor.sentAt);
-        if (&anchor == &anchorLeft) {
-            _uwbData.distLeft = -1; _uwbData.validLeft = false;
-        } else {
-            _uwbData.distRight = -1; _uwbData.validRight = false;
-        }
+        uwb_write_dist(anchor, -1.0f);
         anchor.pollState = PollState::IDLE;
     }
 }
@@ -346,9 +338,18 @@ void uwb_update() {
         return;
     }
 
-    // phase == RIGHT_PENDING
-    uwb_update_anchor(anchorRight);
-    if (anchorRight.pollState == PollState::IDLE) {
+    if (phase == CyclePhase::RIGHT_PENDING) {
+        uwb_update_anchor(anchorRight);
+        if (anchorRight.pollState == PollState::IDLE) {
+            uwb_start_poll(anchorFront);
+            phase = CyclePhase::FRONT_PENDING;
+        }
+        return;
+    }
+
+    // phase == FRONT_PENDING
+    uwb_update_anchor(anchorFront);
+    if (anchorFront.pollState == PollState::IDLE) {
         bool lv = anchorLeft.rawDist  >= 0;
         bool rv = anchorRight.rawDist >= 0;
         if (lv && rv)  _uwbData.distFast = (anchorLeft.rawDist + anchorRight.rawDist) / 2.0f;
@@ -363,64 +364,3 @@ void uwb_update() {
 const UWBReading& uwb_get() {
     return _uwbData;
 }
-
-// =============================================================================
-// UWB serial passthrough — remove this block (and the call in main.cpp) to disable
-// Usage via telnet/serial: uwb left|right|rear <AT command>
-// Example: uwb left AT+ADDRESS?
-// =============================================================================
-static char _passthroughBuf[128] = {};
-static int  _passthroughPos      = 0;
-
-static UWBAnchor* uwb_anchor_by_name(const char* name) {
-    if (strcmp(name, "left")  == 0) return &anchorLeft;
-    if (strcmp(name, "right") == 0) return &anchorRight;
-    if (strcmp(name, "front") == 0) return &anchorFront;
-    return nullptr;
-}
-
-void uwb_passthrough_update() {
-    while (Serial.available()) {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r') {
-            if (_passthroughPos == 0) continue;
-            _passthroughBuf[_passthroughPos] = '\0';
-            _passthroughPos = 0;
-
-            if (strncmp(_passthroughBuf, "uwb ", 4) != 0) continue;
-            char* rest  = _passthroughBuf + 4;
-            char* space = strchr(rest, ' ');
-            if (!space) { Serial.println("usage: uwb left|right|rear <AT command>"); continue; }
-            *space = '\0';
-            char* cmd = space + 1;
-
-            UWBAnchor* anchor = uwb_anchor_by_name(rest);
-            if (!anchor) { Serial.printf("unknown anchor: %s\n", rest); continue; }
-
-            while (anchor->serial.available()) anchor->serial.read();
-            anchor->serial.print(cmd);
-            anchor->serial.print("\r\n");
-
-            uint32_t sentAt = millis();
-            char buf[128]; int pos = 0; bool gotResponse = false;
-            while (millis() - sentAt < UWB_RESPONSE_TIMEOUT_MS) {
-                while (anchor->serial.available() && pos < 127) {
-                    char rc = anchor->serial.read();
-                    if (rc == '\n') {
-                        buf[pos] = '\0';
-                        if (pos > 0) { Serial.println(buf); gotResponse = true; }
-                        pos = 0;
-                    } else if (rc != '\r') {
-                        buf[pos++] = rc;
-                    }
-                }
-            }
-            if (!gotResponse) Serial.println("(no response)");
-        } else if (_passthroughPos < 127) {
-            _passthroughBuf[_passthroughPos++] = c;
-        }
-    }
-}
-// =============================================================================
-// End UWB serial passthrough
-// =============================================================================

@@ -27,7 +27,7 @@ static Servo          steerServo;
 static ControlOutput  _controlOutput = {0.0f, 0.0f};
 static PidController  _throttlePid  = { THROTTLE_PID_KP,  THROTTLE_PID_KI,  THROTTLE_PID_KD  };
 static PidController  _steeringPid  = { STEERING_PID_KP,  STEERING_PID_KI,  STEERING_PID_KD  };
-static NavState       _prevState    = NavState::STOPPED;
+static NavMode       _prevState    = NavMode::STOPPED;
 
 // Normalise a heading difference to [-180, +180] to handle the 360→0 wraparound.
 static float headingError(float target, float current) {
@@ -61,8 +61,9 @@ static int float_to_pwm(float val) {
 
 void control_apply(const ControlOutput &out) {
     _controlOutput = out;
-    escServo.writeMicroseconds(constrain(float_to_pwm(out.throttle),  PWM_MIN_US, PWM_MAX_US));
-    steerServo.writeMicroseconds(constrain(float_to_pwm(out.steering), PWM_MIN_US, PWM_MAX_US));
+    float steering = constrain(out.steering, -STEERING_MAX, STEERING_MAX);
+    escServo.writeMicroseconds(constrain(float_to_pwm(out.throttle), PWM_MIN_US, PWM_MAX_US));
+    steerServo.writeMicroseconds(constrain(float_to_pwm(steering),   PWM_MIN_US, PWM_MAX_US));
 }
 
 void control_update() {
@@ -72,7 +73,7 @@ void control_update() {
     float dt;
     bool pidTick = gate.tick(dt);
 
-    digitalWrite(PIN_LED, nav.state == NavState::FOLLOW_ME ? HIGH : LOW);
+    digitalWrite(PIN_LED, nav.mode == NavMode::FOLLOW_ME ? HIGH : LOW);
 
     // Step 1 & 2: determine intent — set targetSpeed/directThrottle and steeringSetpoint/directSteering
     float targetSpeed      = NAN;   // NAN → bypass throttle PID
@@ -82,32 +83,31 @@ void control_update() {
     float directSteering   = 0.0f;
 
     // Reset steering PID on every mode transition.
-    if (nav.state != _prevState) {
+    if (nav.mode != _prevState) {
         _steeringPid.reset();
     }
-    _prevState = nav.state;
+    _prevState = nav.mode;
 
     float holdErr = headingError(nav.headingHold, imu.yaw);
 
-    switch (nav.state) {
-        case NavState::FOLLOW_ME:
+    switch (nav.mode) {
+        case NavMode::FOLLOW_ME:
             //Todo Need to integrate heading change and use that to adjust steering between waypoint measurements.
             steeringSetpoint = 0.0f;
             steeringMeasure  = nav.relativeAngle;
             if (nav.distanceCm > rtConfig.followDistanceCm)
                 targetSpeed = rtConfig.targetSpeedMph;
             break;
-        case NavState::WAYPOINT:
-        case NavState::TEST:
+        case NavMode::TEST:
             targetSpeed      = rtConfig.targetSpeedMph;
             steeringSetpoint = imu.yaw + holdErr;
             steeringMeasure  = imu.yaw;
             break;
-        case NavState::STALE:
+        case NavMode::STALE:
             steeringSetpoint = imu.yaw + holdErr;
             steeringMeasure  = imu.yaw;
             break;
-        case NavState::STOPPED:
+        case NavMode::STOPPED:
             break;  // directThrottle = 0, directSteering = 0
     }
 
@@ -115,7 +115,7 @@ void control_update() {
     ControlOutput out = _controlOutput;
     if (!isnan(steeringSetpoint)) {
         if (pidTick) {
-            out.steering = constrain(_steeringPid.update(steeringSetpoint, steeringMeasure, dt), -1.0f, 1.0f);
+            out.steering = _steeringPid.update(steeringSetpoint, steeringMeasure, dt);
         }
         // else hold last steering until next pidTick
     } else {

@@ -10,6 +10,7 @@
 #include "wifi_config.h"
 #include "rpm.h"
 #include "dashboard.h"
+#include "camera.h"
 #include "esp_log.h"
 
 static const char* TAG = "perf";
@@ -53,8 +54,9 @@ void setup()
     control_init();
     rpm_init();
     dashboard_init();
+    camera_init();
 
-    nav_set_mode(NavState::FOLLOW_ME);
+    nav_set_mode(DEFAULT_NAV_MODE);
     Serial.println("⭐⭐⭐⭐⭐ Setup Complete ⭐⭐⭐⭐⭐");
     if (UWB_DIAGNOSTICS_ON_STARTUP){
         Serial.println("⭐⭐⭐⭐⭐ Running UWB Diagnostics ⭐⭐⭐⭐⭐");
@@ -71,10 +73,10 @@ void loop()
     perfUwb.begin();  uwb_update();            perfUwb.end();
     perfNav.begin();  nav_update();               perfNav.end();
     perfCtrl.begin(); control_update();           perfCtrl.end();
+    camera_update();
     perfOled.begin(); oled_update(loopHz.hz);  perfOled.end();
     perfWifi.begin(); wifi_update();              perfWifi.end();
     rpm_update();
     dashboard_update(loopHz.hz);
     perf_report(loopHz.hz);
-    // // uwb_passthrough_update();
 }

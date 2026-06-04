@@ -120,3 +120,55 @@ CONTROL_UPDATE_INTERVAL_MS = 20
 **Notes:** OLED 25ms I2C transfer every 100ms is the primary bottleneck — causes I2C bus contention with IMU, depressed loop rate (~2760 lps), and high IMU jitter (~38ms avg).
 
 ---
+
+## Benchmark #2 — 2026-05-20
+
+**Note:** UWB live ranging — left+right anchors responding, tag at ~200cm (~8–25° right of center)
+
+**Loop config:**
+```
+perfImu.begin();  imu_update();               perfImu.end();   // ACTIVE
+perfUwb.begin();  uwb_update();               perfUwb.end();   // ACTIVE
+perfNav.begin();  nav_update();               perfNav.end();   // ACTIVE
+perfCtrl.begin(); control_update();           perfCtrl.end();  // ACTIVE
+perfOled.begin(); oled_update(loopHz.hz);     perfOled.end();  // ACTIVE
+perfWifi.begin(); wifi_update();              perfWifi.end();  // ACTIVE
+rpm_update();                                                  // ACTIVE
+dashboard_update(loopHz.hz);                                   // ACTIVE
+```
+
+**Timing config:**
+```
+IMU_POLLING_INTERVAL_MS    = 10
+IMU_REPORT_INTERVAL_MS     = 10
+UWB_POLL_INTERVAL_MS       = 50
+UWB_ANCHOR_STAGGER_MS      = 25
+UWB_RESPONSE_TIMEOUT_MS    = 500
+OLED_UPDATE_INTERVAL_MS    = 100
+CONTROL_UPDATE_INTERVAL_MS = 20
+```
+
+**UWB state:** Left + right anchors responding; tag at ~200cm, 8–25° right of center (~5Hz ranging rate)
+
+**Averaged results** _(computed from 8 perf report samples, 10 rotation interval samples; first 2 skipped)_**:**
+
+| Metric | Avg | Max (avg of maxes) |
+|--------|-----|--------------------|
+| Loop rate (lps) | 2425 | — |
+| IMU exec (µs) | 161 | 24,000 |
+| UWB exec (µs) | 5 | 599 |
+| Nav exec (µs) | 16 | 7,800 |
+| Ctrl exec (µs) | 53 | 143 |
+| OLED exec (µs) | 104 | 25,400 |
+| WiFi exec (µs) | 42 | 152 |
+
+| IMU rotation interval | Value |
+|-----------------------|-------|
+| avg | 12.4ms |
+| min (avg of mins) | 2.8ms |
+| max (avg of maxes) | 38.3ms |
+| jitter (avg of jitters) | 35.6ms |
+
+**Notes:** UWB exec avg drops from 8µs (timeout path) to 5µs when anchors are responding — timeout path is slightly more expensive due to repeated millis() checks. OLED remains the primary bottleneck (25ms I2C transfer). UWB ranging cycle is ~200ms (50ms poll interval + sequential left→right polling each taking up to ~100ms). IMU jitter is comparable to Benchmark #1 — OLED I2C contention still dominant.
+
+---
