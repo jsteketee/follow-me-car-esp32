@@ -5,6 +5,7 @@ struct ImuData {
     float yaw;
     float pitch;
     float roll;
+    float yawRate;         // deg/s, derived from consecutive rotation vector readings
     float ax, ay, az;
     float gx, gy, gz;
     uint8_t  cal_rot;

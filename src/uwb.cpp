@@ -3,6 +3,7 @@
 
 #include "uwb.h"
 #include "config.h"
+#include "runtime_config.h"
 #include "utils.h"
 #include "wifi_config.h"
 #include "esp_log.h"
@@ -281,7 +282,7 @@ static void uwb_update_anchor(UWBAnchor& anchor) {
                 bool headingStale = millis() - _uwbData.timestamp > UWB_STALE_HEADING_MS;
                 if (valid && anchor.prevDist >= 0.0f && !headingStale) {
                     float jump = fabsf((float)dist - anchor.prevDist);
-                    if (jump > UWB_OUTLIER_REJECT_CM && anchor.rejectStreak < UWB_OUTLIER_MAX_STREAK) {
+                    if (jump > rtConfig.uwbOutlierRejectCm && anchor.rejectStreak < UWB_OUTLIER_MAX_STREAK) {
                         ESP_LOGW(TAG, "⚠️ [%s/%s] outlier rejected: %dcm (prev=%.0fcm jump=%.0fcm streak=%d)",
                                  anchor.position, anchor.moduleName, dist, anchor.prevDist, jump, anchor.rejectStreak + 1);
                         anchor.rejectStreak++;
@@ -294,7 +295,7 @@ static void uwb_update_anchor(UWBAnchor& anchor) {
                 }
 
                 anchor.rawDist = valid ? (float)dist : anchor.rawDist;
-                float filtered = valid ? anchor.kalman.update((float)dist, UWB_KALMAN_Q, UWB_KALMAN_R) : anchor.kalman.x;
+                float filtered = valid ? anchor.kalman.update((float)dist, rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR) : anchor.kalman.x;
                 ESP_LOGD(TAG, "✅ [%s/%s] raw=%d filtered=%.1f cm  latency=%ums", anchor.position, anchor.moduleName, dist, filtered, latency);
                 uwb_write_dist(anchor, valid ? filtered : -1.0f);
                 anchor.pollState = PollState::IDLE;
@@ -307,7 +308,7 @@ static void uwb_update_anchor(UWBAnchor& anchor) {
     }
 
     if (millis() - anchor.sentAt >= UWB_RESPONSE_TIMEOUT_MS) {
-        ESP_LOGW(TAG, "⚠️ [%s/%s] no response  latency=%ums", anchor.position, anchor.moduleName, millis() - anchor.sentAt);
+        // ESP_LOGW(TAG, "⚠️ [%s/%s] no response  latency=%ums", anchor.position, anchor.moduleName, millis() - anchor.sentAt);
         uwb_write_dist(anchor, -1.0f);
         anchor.pollState = PollState::IDLE;
     }

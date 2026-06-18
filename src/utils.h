@@ -19,6 +19,38 @@ struct KalmanFilter {
     }
 };
 
+// 2-state Kalman filter: state = [angle (deg), gyroBias (deg/s)]
+// predict() driven by IMU gyro rate; correct() called per sensor measurement.
+struct AngleKalman {
+    float angle    = 0.0f;
+    float gyroBias = 0.0f;
+    float P[2][2]  = {{1.0f, 0.0f}, {0.0f, 1.0f}};
+
+    void predict(float gyroRateDegps, float dt, float qAngle, float qBias) {
+        angle += (gyroRateDegps - gyroBias) * dt;
+        float dt2 = dt * dt;
+        float p00 = P[0][0] - dt*P[1][0] - dt*P[0][1] + dt2*P[1][1] + qAngle;
+        float p01 = P[0][1] - dt*P[1][1];
+        float p10 = P[1][0] - dt*P[1][1];
+        float p11 = P[1][1] + qBias;
+        P[0][0]=p00; P[0][1]=p01; P[1][0]=p10; P[1][1]=p11;
+    }
+
+    void correct(float measurement, float r) {
+        float y  = measurement - angle;
+        float S  = P[0][0] + r;
+        float K0 = P[0][0] / S;
+        float K1 = P[1][0] / S;
+        angle    += K0 * y;
+        gyroBias += K1 * y;
+        float p00 = P[0][0] - K0*P[0][0];
+        float p01 = P[0][1] - K0*P[0][1];
+        float p10 = P[1][0] - K1*P[0][0];
+        float p11 = P[1][1] - K1*P[0][1];
+        P[0][0]=p00; P[0][1]=p01; P[1][0]=p10; P[1][1]=p11;
+    }
+};
+
 // Tracks avg and max execution time per step. Call begin() before and end() after each call, reset() after reporting.
 struct PerfTracker {
     uint32_t _start = 0;

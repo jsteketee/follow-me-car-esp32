@@ -11,6 +11,7 @@
 #include "rpm.h"
 #include "dashboard.h"
 #include "camera.h"
+#include "fusion.h"
 #include "esp_log.h"
 
 static const char* TAG = "perf";
@@ -54,7 +55,8 @@ void setup()
     control_init();
     rpm_init();
     dashboard_init();
-    camera_init();
+    // camera_init();
+    fusion_init();
 
     nav_set_mode(DEFAULT_NAV_MODE);
     Serial.println("⭐⭐⭐⭐⭐ Setup Complete ⭐⭐⭐⭐⭐");
@@ -70,11 +72,12 @@ void loop()
     loopHz.update();
 
     perfImu.begin();  imu_update();               perfImu.end();
-    perfUwb.begin();  uwb_update();            perfUwb.end();
+    perfUwb.begin();  uwb_update();               perfUwb.end();
+    // camera_update();
+    fusion_update();
     perfNav.begin();  nav_update();               perfNav.end();
     perfCtrl.begin(); control_update();           perfCtrl.end();
-    camera_update();
-    perfOled.begin(); oled_update(loopHz.hz);  perfOled.end();
+    perfOled.begin(); oled_update(loopHz.hz);     perfOled.end();
     perfWifi.begin(); wifi_update();              perfWifi.end();
     rpm_update();
     dashboard_update(loopHz.hz);

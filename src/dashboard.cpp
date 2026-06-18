@@ -2,10 +2,12 @@
 // telemetry JSON at ~10 Hz. Config overrides are applied via POST /config.
 #include "dashboard.h"
 #include "nav.h"
+#include "fusion.h"
 #include "rpm.h"
 #include "imu.h"
 #include "control.h"
 #include "runtime_config.h"
+#include "utils.h"
 #include <ESPAsyncWebServer.h>
 #include <Arduino.h>
 #include "esp_log.h"
@@ -41,6 +43,7 @@ canvas{width:100%;display:block}
 .srow label{display:flex;justify-content:space-between;font-size:0.85em;margin-bottom:3px}
 .srow label span:last-child{color:#4af}
 input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
+@media(max-width:600px){.cfg-row .card{flex:1 1 100%}}
 #dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#444;margin-right:7px;vertical-align:middle;transition:background 0.3s}
 #dot.on{background:#4f4}
 </style>
@@ -76,45 +79,6 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
     <h2>Heading</h2>
     <canvas id="arrow" width="180" height="180"></canvas>
   </div>
-  <div class="card">
-    <h2>Config</h2>
-    <div class="srow">
-      <label><span>Throttle Scale</span><span id="v_ts">--</span></label>
-      <input type="range" id="throttleScale" min="0.05" max="1.0" step="0.05">
-    </div>
-    <div class="srow">
-      <label><span>Throttle Smooth</span><span id="v_sa">--</span></label>
-      <input type="range" id="smoothAlpha" min="0.001" max="1.0" step="0.001">
-    </div>
-    <div class="srow">
-      <label><span>Throttle FF</span><span id="v_tff">--</span></label>
-      <input type="range" id="throttleFfK" min="0" max="0.5" step="0.005">
-    </div>
-    <div class="srow">
-      <label><span>Follow Distance</span><span id="v_fd">--</span></label>
-      <input type="range" id="followDistanceCm" min="50" max="500" step="10">
-    </div>
-    <div class="srow">
-      <label><span>Max Distance</span><span id="v_md">--</span></label>
-      <input type="range" id="maxDistanceCm" min="200" max="1500" step="25">
-    </div>
-    <div class="srow">
-      <label><span>Target Speed</span><span id="v_sp">--</span></label>
-      <input type="range" id="targetSpeedMph" min="0.5" max="10.0" step="0.5">
-    </div>
-    <div class="srow">
-      <label><span>KP</span><span id="v_kp">--</span></label>
-      <input type="range" id="kp" min="0.0" max="4.0" step="0.05">
-    </div>
-    <div class="srow">
-      <label><span>KI</span><span id="v_ki">--</span></label>
-      <input type="range" id="ki" min="0.0" max="4.0" step="0.01">
-    </div>
-    <div class="srow">
-      <label><span>KD</span><span id="v_kd">--</span></label>
-      <input type="range" id="kd" min="0.0" max="4.0" step="0.01">
-    </div>
-  </div>
 </div>
 <div class="row">
   <div class="card" style="flex:0 0 auto">
@@ -130,6 +94,82 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   <div class="card">
     <h2>Speed (mph) + Throttle — last 10s</h2>
     <canvas id="speedGraph" height="80"></canvas>
+  </div>
+</div>
+<div class="row cfg-row">
+  <div class="card">
+    <h2>Throttle</h2>
+    <div class="srow">
+      <label><span>Target Speed — speed setpoint while following</span><span id="v_sp">--</span></label>
+      <input type="range" id="targetSpeedMph" min="0.5" max="4.0" step="0.1">
+    </div>
+    <div class="srow">
+      <label><span>Follow Distance — stop below this</span><span id="v_fd">--</span></label>
+      <input type="range" id="followDistanceCm" min="50" max="400" step="10">
+    </div>
+    <div class="srow">
+      <label><span>Throttle Scale — max PWM output cap</span><span id="v_ts">--</span></label>
+      <input type="range" id="throttleScale" min="0.045" max="0.36" step="0.005">
+    </div>
+    <div class="srow">
+      <label><span>KP — speed PID proportional gain</span><span id="v_kp">--</span></label>
+      <input type="range" id="kp" min="1.0" max="8.0" step="0.1">
+    </div>
+    <div class="srow">
+      <label><span>KI — speed PID integral gain</span><span id="v_ki">--</span></label>
+      <input type="range" id="ki" min="0.12" max="1.0" step="0.025">
+    </div>
+  </div>
+  <div class="card">
+    <h2>Steering</h2>
+    <div class="srow">
+      <label><span>KP — angle PID proportional gain</span><span id="v_sKp">--</span></label>
+      <input type="range" id="steeringKp" min="0.0025" max="0.02" step="0.0005">
+    </div>
+    <div class="srow">
+      <label><span>KI — angle PID integral gain</span><span id="v_sKi">--</span></label>
+      <input type="range" id="steeringKi" min="0.001" max="0.008" step="0.0002">
+    </div>
+    <div class="srow">
+      <label><span>Max — servo deflection cap (0–1)</span><span id="v_sMax">--</span></label>
+      <input type="range" id="steeringMax" min="0.16" max="1.0" step="0.01">
+    </div>
+  </div>
+</div>
+<div class="row cfg-row">
+  <div class="card">
+    <h2>UWB Filtering</h2>
+    <div class="srow">
+      <label><span>Kalman Q — process noise, higher = faster tracking</span><span id="v_uQ">--</span></label>
+      <input type="range" id="uwbKalmanQ" min="2.0" max="16.0" step="0.5">
+    </div>
+    <div class="srow">
+      <label><span>Kalman R — sensor noise, lower = more trust</span><span id="v_uR">--</span></label>
+      <input type="range" id="uwbKalmanR" min="19.0" max="150.0" step="2.5">
+    </div>
+    <div class="srow">
+      <label><span>Outlier Reject — discard jumps larger than this</span><span id="v_uOr">--</span></label>
+      <input type="range" id="uwbOutlierRejectCm" min="8.0" max="60.0" step="1.0">
+    </div>
+  </div>
+  <div class="card">
+    <h2>Fusion</h2>
+    <div class="srow">
+      <label><span>Bearing Q/sec — bearing drift rate between fixes</span><span id="v_fQ">--</span></label>
+      <input type="range" id="fusionQBearingPerSec" min="6.0" max="50.0" step="1.0">
+    </div>
+    <div class="srow">
+      <label><span>Bearing R (UWB) — lower = trust each fix more</span><span id="v_fR">--</span></label>
+      <input type="range" id="fusionRUwb" min="25.0" max="200.0" step="5.0">
+    </div>
+    <div class="srow">
+      <label><span>Stale Threshold — freeze steering/throttle above</span><span id="v_fSU">--</span></label>
+      <input type="range" id="fusionStaleUncertainty" min="50.0" max="400.0" step="10.0">
+    </div>
+    <div class="srow">
+      <label><span>Innov Alpha — interference spike sensitivity</span><span id="v_fEa">--</span></label>
+      <input type="range" id="fusionInnovEwmaAlpha" min="0.025" max="0.2" step="0.005">
+    </div>
   </div>
 </div>
 <div class="row">
@@ -185,16 +225,22 @@ function render(d) {
   set('cal_acc',  d.cal_acc + '/3');
   set('lps',      d.lps.toFixed(0));
   if (d.cfg) {
-    slide('throttleScale', d.cfg.ts, 'v_ts', v => v.toFixed(2));
-    slide('smoothAlpha',   d.cfg.sa,  'v_sa',  v => v.toFixed(3));
-    slide('throttleFfK',   d.cfg.tff, 'v_tff', v => v.toFixed(3));
-    slide('followDistanceCm', d.cfg.fd, 'v_fd', v => v.toFixed(0) + ' cm');
-    slide('maxDistanceCm',    d.cfg.md, 'v_md', v => v.toFixed(0) + ' cm');
-    slide('targetSpeedMph',   d.cfg.sp, 'v_sp', v => v.toFixed(1) + ' mph');
+    slide('targetSpeedMph',      d.cfg.sp,  'v_sp',   v => v.toFixed(1) + ' mph');
+    slide('followDistanceCm',    d.cfg.fd,  'v_fd',   v => v.toFixed(0) + ' cm');
+    slide('throttleScale',       d.cfg.ts,  'v_ts',   v => v.toFixed(3));
+    slide('kp',                  d.cfg.kp,  'v_kp',   v => v.toFixed(2));
+    slide('ki',                  d.cfg.ki,  'v_ki',   v => v.toFixed(3));
+    slide('steeringKp',          d.cfg.sKp, 'v_sKp',  v => v.toFixed(4));
+    slide('steeringKi',          d.cfg.sKi, 'v_sKi',  v => v.toFixed(4));
+    slide('steeringMax',         d.cfg.sMax,'v_sMax',  v => v.toFixed(2));
+    slide('uwbKalmanQ',          d.cfg.uQ,  'v_uQ',   v => v.toFixed(1));
+    slide('uwbKalmanR',          d.cfg.uR,  'v_uR',   v => v.toFixed(1));
+    slide('uwbOutlierRejectCm',  d.cfg.uOr, 'v_uOr',  v => v.toFixed(0) + ' cm');
+    slide('fusionQBearingPerSec',d.cfg.fQ,  'v_fQ',   v => v.toFixed(1));
+    slide('fusionRUwb',          d.cfg.fR,  'v_fR',   v => v.toFixed(0));
+    slide('fusionStaleUncertainty',d.cfg.fSU,'v_fSU', v => v.toFixed(0));
+    slide('fusionInnovEwmaAlpha',d.cfg.fEa, 'v_fEa',  v => v.toFixed(3));
     _targetSpeedMph = d.cfg.sp;
-    slide('kp', d.cfg.kp, 'v_kp', v => v.toFixed(2));
-    slide('ki', d.cfg.ki, 'v_ki', v => v.toFixed(2));
-    slide('kd', d.cfg.kd, 'v_kd', v => v.toFixed(2));
   }
   speedBuf.push(d.speed);
   speedBuf.shift();
@@ -226,7 +272,10 @@ function setMode(m) {
   fetch('/mode?mode=' + m, {method:'POST'});
 }
 
-['throttleScale','smoothAlpha','throttleFfK','followDistanceCm','maxDistanceCm','targetSpeedMph','kp','ki','kd'].forEach(id => {
+['throttleScale','followDistanceCm','targetSpeedMph','kp','ki',
+ 'steeringKp','steeringKi','steeringMax',
+ 'uwbKalmanQ','uwbKalmanR','uwbOutlierRejectCm',
+ 'fusionQBearingPerSec','fusionRUwb','fusionStaleUncertainty','fusionInnovEwmaAlpha'].forEach(id => {
   document.getElementById(id).addEventListener('change', () => {
     fetch('/config?key=' + id + '&value=' + document.getElementById(id).value, {method:'POST'});
   });
@@ -450,15 +499,25 @@ void dashboard_init() {
         if (req->hasParam("key") && req->hasParam("value")) {
             String key = req->getParam("key")->value();
             float  val = req->getParam("value")->value().toFloat();
-            if      (key == "throttleScale")    rtConfig.throttleScale    = val;
-            else if (key == "smoothAlpha")      rtConfig.smoothAlpha      = val;
-            else if (key == "throttleFfK")      rtConfig.throttleFfK      = val;
-            else if (key == "followDistanceCm") rtConfig.followDistanceCm = val;
-            else if (key == "maxDistanceCm")    rtConfig.maxDistanceCm    = val;
-            else if (key == "targetSpeedMph")   rtConfig.targetSpeedMph   = val;
-            else if (key == "kp")               rtConfig.kp               = val;
-            else if (key == "ki")               rtConfig.ki               = val;
-            else if (key == "kd")               rtConfig.kd               = val;
+            if      (key == "throttleScale")          rtConfig.throttleScale          = val;
+            else if (key == "smoothAlpha")            rtConfig.smoothAlpha            = val;
+            else if (key == "throttleFfK")            rtConfig.throttleFfK            = val;
+            else if (key == "followDistanceCm")       rtConfig.followDistanceCm       = val;
+            else if (key == "maxDistanceCm")          rtConfig.maxDistanceCm          = val;
+            else if (key == "targetSpeedMph")         rtConfig.targetSpeedMph         = val;
+            else if (key == "kp")                     rtConfig.kp                     = val;
+            else if (key == "ki")                     rtConfig.ki                     = val;
+            else if (key == "kd")                     rtConfig.kd                     = val;
+            else if (key == "steeringKp")             rtConfig.steeringKp             = val;
+            else if (key == "steeringKi")             rtConfig.steeringKi             = val;
+            else if (key == "steeringMax")            rtConfig.steeringMax            = val;
+            else if (key == "uwbKalmanQ")             rtConfig.uwbKalmanQ             = val;
+            else if (key == "uwbKalmanR")             rtConfig.uwbKalmanR             = val;
+            else if (key == "uwbOutlierRejectCm")     rtConfig.uwbOutlierRejectCm     = val;
+            else if (key == "fusionQBearingPerSec")   rtConfig.fusionQBearingPerSec   = val;
+            else if (key == "fusionRUwb")             rtConfig.fusionRUwb             = val;
+            else if (key == "fusionStaleUncertainty") rtConfig.fusionStaleUncertainty = val;
+            else if (key == "fusionInnovEwmaAlpha")   rtConfig.fusionInnovEwmaAlpha   = val;
             ESP_LOGI(TAG, "config %s = %.3f", key.c_str(), val);
         }
         req->send(200);
@@ -486,33 +545,37 @@ void dashboard_init() {
 
 static float    safeF(float v) { return isnan(v) || isinf(v) ? 0.0f : v; }
 static PerfData _perf = {};
+static RateGate _gate{ DASHBOARD_UPDATE_INTERVAL_MS };
 void dashboard_set_perf(const PerfData& p) { _perf = p; }
 
 void dashboard_update(float lps) {
-    const NavData&       nav  = nav_get();
-    const RPMData&       rpm  = rpm_get();
-    const ImuData&       imu  = imu_get();
-    const ControlOutput& ctrl = control_get();
-    static uint32_t lastMs = 0;
-    if (millis() - lastMs < 100) return;
-    lastMs = millis();
+    const NavData&       nav   = nav_get();
+    const Pose&     fused = fusion_get();
+    const RPMData&       rpm   = rpm_get();
+    const ImuData&       imu   = imu_get();
+    const ControlOutput& ctrl  = control_get();
+    float dt;
+    if (!_gate.tick(dt)) return;
 
     _webSocket.cleanupClients();
 
-    char buf[900];
+    char buf[1200];
     snprintf(buf, sizeof(buf),
         "{\"dist\":%.1f,\"angle\":%.1f,\"headingHold\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
         "\"speed\":%.3f,\"rpm\":%.0f,"
         "\"heading\":%.1f,\"cal_rot\":%u,\"cal_acc\":%u,"
         "\"throttle\":%.3f,\"steering\":%.3f,\"lps\":%.0f,"
         "\"cfg\":{\"ts\":%.3f,\"sa\":%.3f,\"tff\":%.3f,\"fd\":%.0f,\"md\":%.0f,\"sp\":%.2f,"
-        "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f},"
+        "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,"
+        "\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
+        "\"uQ\":%.2f,\"uR\":%.2f,\"uOr\":%.1f,"
+        "\"fQ\":%.2f,\"fR\":%.1f,\"fSU\":%.1f,\"fEa\":%.4f},"
         "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,\"na\":%u,\"nm\":%u,"
         "\"ca\":%u,\"cm\":%u,\"oa\":%u,\"om\":%u,\"wa\":%u,\"wm\":%u}}",
-        safeF(nav.distanceCm), safeF(nav.relativeAngle), safeF(nav.headingHold),
-        nav.mode == NavMode::FOLLOW_ME  ? "FOLLOW_ME" :
-        nav.mode == NavMode::TEST    ? "TEST"    :
-        nav.mode == NavMode::STOPPED ? "STOPPED" : "STALE",
+        safeF(fused.distanceCm), safeF(fused.angle), safeF(nav.headingHold),
+        nav.mode == NavMode::FOLLOW_ME ? "FOLLOW_ME" :
+        nav.mode == NavMode::TEST      ? "TEST"      :
+        nav.mode == NavMode::STOPPED   ? "STOPPED"   : "UNKNOWN",
         safeF(rpm.odometryCm),
         safeF(rpm.speedMph), safeF(rpm.rpm),
         safeF(imu.yaw), imu.cal_rot, imu.cal_accel,
@@ -521,6 +584,10 @@ void dashboard_update(float lps) {
         rtConfig.followDistanceCm, rtConfig.maxDistanceCm,
         rtConfig.targetSpeedMph,
         rtConfig.kp, rtConfig.ki, rtConfig.kd,
+        rtConfig.steeringKp, rtConfig.steeringKi, rtConfig.steeringMax,
+        rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR, rtConfig.uwbOutlierRejectCm,
+        rtConfig.fusionQBearingPerSec, rtConfig.fusionRUwb,
+        rtConfig.fusionStaleUncertainty, rtConfig.fusionInnovEwmaAlpha,
         _perf.imuAvg,  _perf.imuMax,
         _perf.uwbAvg,  _perf.uwbMax,
         _perf.navAvg,  _perf.navMax,

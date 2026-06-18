@@ -6,6 +6,5 @@ struct ControlOutput {
 };
 
 void control_init();
-void control_apply(const ControlOutput &output);
 void control_update();
 const ControlOutput& control_get();
