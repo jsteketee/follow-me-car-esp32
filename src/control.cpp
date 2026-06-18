@@ -5,7 +5,7 @@
 // Control Vehicle
 #include "control.h"
 #include "nav.h"
-#include "imu.h"
+#include "fusion.h"
 #include "config.h"
 #include "runtime_config.h"
 #include "utils.h"
@@ -27,15 +27,9 @@ static Servo          steerServo;
 static ControlOutput  _controlOutput = {0.0f, 0.0f};
 static PidController  _throttlePid  = { THROTTLE_PID_KP,  THROTTLE_PID_KI,  THROTTLE_PID_KD  };
 static PidController  _steeringPid  = { STEERING_PID_KP,  STEERING_PID_KI,  STEERING_PID_KD  };
-static NavMode       _prevState    = NavMode::STOPPED;
+static NavMode        _prevNavMode    = NavMode::STOPPED;
+static RateGate       _gate{ CONTROL_UPDATE_INTERVAL_MS };
 
-// Normalise a heading difference to [-180, +180] to handle the 360→0 wraparound.
-static float headingError(float target, float current) {
-    float e = target - current;
-    while (e >  180.0f) e -= 360.0f;
-    while (e < -180.0f) e += 360.0f;
-    return e;
-}
 
 const ControlOutput& control_get() { return _controlOutput; }
 
@@ -59,88 +53,91 @@ static int float_to_pwm(float val) {
     return (int)(PWM_NEUTRAL_US + constrain(val, -1.0f, 1.0f) * 500.0f);
 }
 
-void control_apply(const ControlOutput &out) {
-    _controlOutput = out;
-    float steering = constrain(out.steering, -STEERING_MAX, STEERING_MAX);
-    escServo.writeMicroseconds(constrain(float_to_pwm(out.throttle), PWM_MIN_US, PWM_MAX_US));
-    steerServo.writeMicroseconds(constrain(float_to_pwm(steering),   PWM_MIN_US, PWM_MAX_US));
+static void control_apply() {
+    float steering = constrain(_controlOutput.steering, -rtConfig.steeringMax, rtConfig.steeringMax);
+    escServo.writeMicroseconds(constrain(float_to_pwm(_controlOutput.throttle), PWM_MIN_US, PWM_MAX_US));
+    steerServo.writeMicroseconds(constrain(float_to_pwm(steering), PWM_MIN_US, PWM_MAX_US));
 }
 
 void control_update() {
-    const NavData& nav = nav_get();
-    const ImuData& imu = imu_get();
-    static RateGate gate{ CONTROL_UPDATE_INTERVAL_MS };
+    const NavData&   nav   = nav_get();
+    const Pose& pose = fusion_get();
     float dt;
-    bool pidTick = gate.tick(dt);
+    bool pidTick = _gate.tick(dt);
+
+    // Apply runtime-tunable gains from dashboard
+    _throttlePid.kp = rtConfig.kp;
+    _throttlePid.ki = rtConfig.ki;
+    _throttlePid.kd = rtConfig.kd;
+    _steeringPid.kp = rtConfig.steeringKp;
+    _steeringPid.ki = rtConfig.steeringKi;
 
     digitalWrite(PIN_LED, nav.mode == NavMode::FOLLOW_ME ? HIGH : LOW);
 
-    // Step 1 & 2: determine intent — set targetSpeed/directThrottle and steeringSetpoint/directSteering
+    // Freeze angle at last valid reading so steering holds course during sensor dropout.
+    static float _lastValidAngle = 0.0f;
+    // if (nav.sensorsValid) {
+    _lastValidAngle = pose.angle;
+    // }
+
+    // Step 1 & 2: determine intent — set targetSpeed and steeringSetpoint
     float targetSpeed      = NAN;   // NAN → bypass throttle PID
-    float directThrottle   = 0.0f;
     float steeringSetpoint = NAN;   // NAN → bypass steering PID
     float steeringMeasure  = 0.0f;
-    float directSteering   = 0.0f;
 
     // Reset steering PID on every mode transition.
-    if (nav.mode != _prevState) {
+    if (nav.mode != _prevNavMode) {
         _steeringPid.reset();
     }
-    _prevState = nav.mode;
+    _prevNavMode = nav.mode;
 
-    float holdErr = headingError(nav.headingHold, imu.yaw);
-
+    //
     switch (nav.mode) {
         case NavMode::FOLLOW_ME:
-            //Todo Need to integrate heading change and use that to adjust steering between waypoint measurements.
+            //Todo Need to integrate heading change and use to adjust steering between waypoint measurements.
             steeringSetpoint = 0.0f;
-            steeringMeasure  = nav.relativeAngle;
-            if (nav.distanceCm > rtConfig.followDistanceCm)
+            steeringMeasure  = _lastValidAngle;
+            if (nav.sensorsValid && pose.distanceCm > rtConfig.followDistanceCm)
                 targetSpeed = rtConfig.targetSpeedMph;
             break;
         case NavMode::TEST:
-            targetSpeed      = rtConfig.targetSpeedMph;
-            steeringSetpoint = imu.yaw + holdErr;
-            steeringMeasure  = imu.yaw;
-            break;
-        case NavMode::STALE:
-            steeringSetpoint = imu.yaw + holdErr;
-            steeringMeasure  = imu.yaw;
+            steeringSetpoint = 0.0f;
+            steeringMeasure  = _lastValidAngle;
+            targetSpeed = rtConfig.targetSpeedMph;
             break;
         case NavMode::STOPPED:
-            break;  // directThrottle = 0, directSteering = 0
+            break;
     }
 
-    // Step 3 & 4: run PIDs or apply direct values
-    ControlOutput out = _controlOutput;
+    // Step 3 & 4: run PIDs or zero outputs
     if (!isnan(steeringSetpoint)) {
-        if (pidTick) {
-            out.steering = _steeringPid.update(steeringSetpoint, steeringMeasure, dt);
-        }
+        if (pidTick)
+            _controlOutput.steering = _steeringPid.update(steeringSetpoint, steeringMeasure, dt);
         // else hold last steering until next pidTick
     } else {
         _steeringPid.reset();
-        out.steering = directSteering;
+        _controlOutput.steering = 0.0f;
     }
     if (!isnan(targetSpeed)) {
-        _throttlePid.kp = rtConfig.kp;
-        _throttlePid.ki = rtConfig.ki;
-        _throttlePid.kd = rtConfig.kd;
         if (pidTick) {
             float pidOut = _throttlePid.update(targetSpeed, rpm_get().speedMph, dt);
             float ffOut  = targetSpeed * rtConfig.throttleFfK;
-            out.throttle = rtConfig.throttleDeadband + constrain(pidOut + ffOut, 0.0f, 1.0f) * (rtConfig.throttleScale - rtConfig.throttleDeadband);
+            _controlOutput.throttle = rtConfig.throttleDeadband + constrain(pidOut + ffOut, 0.0f, 1.0f) * (rtConfig.throttleScale - rtConfig.throttleDeadband);
         }
         // else hold last throttle until next pidTick
     } else {
         _throttlePid.reset();
-        out.throttle = directThrottle;
+        _controlOutput.throttle = 0.0f;
     }
 
     static float _smoothThrottle = 0.0f;
-    _smoothThrottle += rtConfig.smoothAlpha * (out.throttle - _smoothThrottle);
-    out.throttle = _smoothThrottle;
+    if (nav.sensorsValid) {
+        _smoothThrottle += rtConfig.smoothAlpha * (_controlOutput.throttle - _smoothThrottle);
+    } else {
+        _smoothThrottle = 0.0f;
+    }
+    _controlOutput.throttle = _smoothThrottle;
 
-    control_apply(out);
+    control_apply();
 }
 

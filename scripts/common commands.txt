@@ -5,6 +5,9 @@ pio device monitor
 Connect to car wifi for terminal interface
 stty raw -echo && nc 192.168.4.1 23; stty -raw echo
 
+Connect to dashboard
+WiFi: "Follow Me" (no password) → http://192.168.4.1/
+
 pio run -e test --target upload --upload-port 192.168.4.1
 
 ==

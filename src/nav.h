@@ -1,19 +1,17 @@
 #pragma once
+#include "fusion.h"
 
 enum class NavMode {
     FOLLOW_ME,
-    STALE,             // no new UWB data within expected interval
     TEST,
     STOPPED,
 };
 
 struct NavData {
-    float         relativeAngle; // degrees: 0=straight ahead, +right, -left
-    float         distanceCm;    // straight-line distance from anchor midpoint to tag
-    float         headingHold;   // absolute IMU yaw captured when entering a non-NORMAL mode
-    float         updateHz;      // rolling average update rate
-    NavMode      mode;
-    unsigned long timestamp;
+    float    headingHold;   // absolute IMU yaw captured when entering a target heading mode
+    float    updateHz;      // rolling average update rate
+    NavMode  mode;
+    bool     sensorsValid;  // false when fusion uncertainty exceeds FUSION_STALE_UNCERTAINTY
 };
 
 void            nav_update();

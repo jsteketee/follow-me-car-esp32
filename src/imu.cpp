@@ -13,6 +13,7 @@ static Adafruit_BNO08x bno;
 static bool imu_ready = false;
 static sh2_SensorValue_t _sensorEvent;
 static ImuData _imuData = {};
+static RateGate _gate{ IMU_POLLING_INTERVAL_MS };
 
 static void quaternionToEuler(float qw, float qx, float qy, float qz)
 {
@@ -45,6 +46,7 @@ void imu_init()
         return;
     }
     enableReports();
+    sh2_setDcdAutoSave(true);
     imu_ready = true;
     ESP_LOGI(TAG, "✅ BNO085 ready");
 }
@@ -53,13 +55,9 @@ void imu_init()
 void imu_update()
 {
     // Exit early if IMU isn't ready, or if it's not time for an update yet
-    if (!imu_ready)
-        return;
-    static uint32_t lastUpdate = 0;
-    uint32_t now = millis();
-    if (now - lastUpdate < IMU_POLLING_INTERVAL_MS)
-        return;
-    lastUpdate = now;
+    if (!imu_ready) return;
+    float dt;
+    if (!_gate.tick(dt)) return;
 
     // Update and expose the IMU update rate tracker
     _imuHz.update();
@@ -82,6 +80,20 @@ void imu_update()
                 _sensorEvent.un.rotationVector.j,
                 _sensorEvent.un.rotationVector.k);
             _imuData.cal_rot = _sensorEvent.status & 0x03;
+            static float    _prevYaw   = NAN;
+            static uint32_t _prevYawMs = 0;
+            uint32_t nowMsYaw = millis();
+            if (!isnan(_prevYaw)) {
+                float delta = _imuData.yaw - _prevYaw;
+                // Unwrap 0–360° range
+                if (delta >  180.0f) delta -= 360.0f;
+                if (delta < -180.0f) delta += 360.0f;
+                float yawDt = (nowMsYaw - _prevYawMs) / 1000.0f;
+                if (yawDt > 0.0f && yawDt < 0.5f)
+                    _imuData.yawRate = delta / yawDt;
+            }
+            _prevYaw   = _imuData.yaw;
+            _prevYawMs = nowMsYaw;
             static bool headingCalLogged = false;
             if (!headingCalLogged && _imuData.cal_rot == 3) {
                 ESP_LOGI(TAG, "✅ Heading calibrated");
