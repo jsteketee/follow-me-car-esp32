@@ -123,6 +123,10 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   <div class="card">
     <h2>Steering</h2>
     <div class="srow">
+      <label><span>Trim — mechanical bias correction (+ = right)</span><span id="v_sTr">--</span></label>
+      <input type="range" id="steeringTrim" min="-0.3" max="0.3" step="0.01">
+    </div>
+    <div class="srow">
       <label><span>KP — angle PID proportional gain</span><span id="v_sKp">--</span></label>
       <input type="range" id="steeringKp" min="0.0025" max="0.02" step="0.0005">
     </div>
@@ -155,19 +159,27 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   <div class="card">
     <h2>Fusion</h2>
     <div class="srow">
-      <label><span>Bearing Q/sec — bearing drift rate between fixes</span><span id="v_fQ">--</span></label>
-      <input type="range" id="fusionQBearingPerSec" min="6.0" max="50.0" step="1.0">
+      <label><span>Sensor Timeout — seconds without fix before stale</span><span id="v_fT">--</span></label>
+      <input type="range" id="sensorTimeoutSec" min="0.5" max="8.0" step="0.5">
     </div>
     <div class="srow">
-      <label><span>Bearing R (UWB) — lower = trust each fix more</span><span id="v_fR">--</span></label>
+      <label><span>Bearing R (UWB) — lower = trust each UWB fix more</span><span id="v_fR">--</span></label>
       <input type="range" id="fusionRUwb" min="25.0" max="200.0" step="5.0">
+    </div>
+    <div class="srow">
+      <label><span>Bearing R (Cam) — lower = trust each camera fix more</span><span id="v_fRc">--</span></label>
+      <input type="range" id="fusionRCamera" min="1.0" max="8.0" step="0.5">
     </div>
     <div class="srow">
       <label><span>Stale Threshold — freeze steering/throttle above</span><span id="v_fSU">--</span></label>
       <input type="range" id="fusionStaleUncertainty" min="50.0" max="400.0" step="10.0">
     </div>
     <div class="srow">
-      <label><span>Innov Alpha — interference spike sensitivity</span><span id="v_fEa">--</span></label>
+      <label><span>Innov Mean Alpha — how fast mean tracks real movement</span><span id="v_fMa">--</span></label>
+      <input type="range" id="fusionInnovMeanAlpha" min="0.1" max="0.8" step="0.05">
+    </div>
+    <div class="srow">
+      <label><span>Innov EWMA Alpha — erratic spike speed and decay</span><span id="v_fEa">--</span></label>
       <input type="range" id="fusionInnovEwmaAlpha" min="0.025" max="0.2" step="0.005">
     </div>
   </div>
@@ -230,15 +242,18 @@ function render(d) {
     slide('throttleScale',       d.cfg.ts,  'v_ts',   v => v.toFixed(3));
     slide('kp',                  d.cfg.kp,  'v_kp',   v => v.toFixed(2));
     slide('ki',                  d.cfg.ki,  'v_ki',   v => v.toFixed(3));
+    slide('steeringTrim',        d.cfg.sTr, 'v_sTr',  v => (v >= 0 ? '+' : '') + v.toFixed(2));
     slide('steeringKp',          d.cfg.sKp, 'v_sKp',  v => v.toFixed(4));
     slide('steeringKi',          d.cfg.sKi, 'v_sKi',  v => v.toFixed(4));
     slide('steeringMax',         d.cfg.sMax,'v_sMax',  v => v.toFixed(2));
     slide('uwbKalmanQ',          d.cfg.uQ,  'v_uQ',   v => v.toFixed(1));
     slide('uwbKalmanR',          d.cfg.uR,  'v_uR',   v => v.toFixed(1));
     slide('uwbOutlierRejectCm',  d.cfg.uOr, 'v_uOr',  v => v.toFixed(0) + ' cm');
-    slide('fusionQBearingPerSec',d.cfg.fQ,  'v_fQ',   v => v.toFixed(1));
+    slide('sensorTimeoutSec',    d.cfg.fT,  'v_fT',   v => v.toFixed(1) + ' s');
     slide('fusionRUwb',          d.cfg.fR,  'v_fR',   v => v.toFixed(0));
+    slide('fusionRCamera',       d.cfg.fRc, 'v_fRc',  v => v.toFixed(0));
     slide('fusionStaleUncertainty',d.cfg.fSU,'v_fSU', v => v.toFixed(0));
+    slide('fusionInnovMeanAlpha', d.cfg.fMa, 'v_fMa',  v => v.toFixed(2));
     slide('fusionInnovEwmaAlpha',d.cfg.fEa, 'v_fEa',  v => v.toFixed(3));
     _targetSpeedMph = d.cfg.sp;
   }
@@ -273,9 +288,9 @@ function setMode(m) {
 }
 
 ['throttleScale','followDistanceCm','targetSpeedMph','kp','ki',
- 'steeringKp','steeringKi','steeringMax',
+ 'steeringTrim','steeringKp','steeringKi','steeringMax',
  'uwbKalmanQ','uwbKalmanR','uwbOutlierRejectCm',
- 'fusionQBearingPerSec','fusionRUwb','fusionStaleUncertainty','fusionInnovEwmaAlpha'].forEach(id => {
+ 'sensorTimeoutSec','fusionRUwb','fusionRCamera','fusionStaleUncertainty','fusionInnovMeanAlpha','fusionInnovEwmaAlpha'].forEach(id => {
   document.getElementById(id).addEventListener('change', () => {
     fetch('/config?key=' + id + '&value=' + document.getElementById(id).value, {method:'POST'});
   });
@@ -508,15 +523,18 @@ void dashboard_init() {
             else if (key == "kp")                     rtConfig.kp                     = val;
             else if (key == "ki")                     rtConfig.ki                     = val;
             else if (key == "kd")                     rtConfig.kd                     = val;
+            else if (key == "steeringTrim")           rtConfig.steeringTrim           = val;
             else if (key == "steeringKp")             rtConfig.steeringKp             = val;
             else if (key == "steeringKi")             rtConfig.steeringKi             = val;
             else if (key == "steeringMax")            rtConfig.steeringMax            = val;
             else if (key == "uwbKalmanQ")             rtConfig.uwbKalmanQ             = val;
             else if (key == "uwbKalmanR")             rtConfig.uwbKalmanR             = val;
             else if (key == "uwbOutlierRejectCm")     rtConfig.uwbOutlierRejectCm     = val;
-            else if (key == "fusionQBearingPerSec")   rtConfig.fusionQBearingPerSec   = val;
+            else if (key == "sensorTimeoutSec")       rtConfig.sensorTimeoutSec       = val;
             else if (key == "fusionRUwb")             rtConfig.fusionRUwb             = val;
+            else if (key == "fusionRCamera")          rtConfig.fusionRCamera          = val;
             else if (key == "fusionStaleUncertainty") rtConfig.fusionStaleUncertainty = val;
+            else if (key == "fusionInnovMeanAlpha")   rtConfig.fusionInnovMeanAlpha   = val;
             else if (key == "fusionInnovEwmaAlpha")   rtConfig.fusionInnovEwmaAlpha   = val;
             ESP_LOGI(TAG, "config %s = %.3f", key.c_str(), val);
         }
@@ -567,12 +585,12 @@ void dashboard_update(float lps) {
         "\"throttle\":%.3f,\"steering\":%.3f,\"lps\":%.0f,"
         "\"cfg\":{\"ts\":%.3f,\"sa\":%.3f,\"tff\":%.3f,\"fd\":%.0f,\"md\":%.0f,\"sp\":%.2f,"
         "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,"
-        "\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
+        "\"sTr\":%.3f,\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
         "\"uQ\":%.2f,\"uR\":%.2f,\"uOr\":%.1f,"
-        "\"fQ\":%.2f,\"fR\":%.1f,\"fSU\":%.1f,\"fEa\":%.4f},"
+        "\"fT\":%.2f,\"fR\":%.1f,\"fRc\":%.1f,\"fSU\":%.1f,\"fMa\":%.3f,\"fEa\":%.4f},"
         "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,\"na\":%u,\"nm\":%u,"
         "\"ca\":%u,\"cm\":%u,\"oa\":%u,\"om\":%u,\"wa\":%u,\"wm\":%u}}",
-        safeF(fused.distanceCm), safeF(fused.angle), safeF(nav.headingHold),
+        safeF(fused.distanceCm), safeF(fused.fusedAngle), safeF(nav.headingHold),
         nav.mode == NavMode::FOLLOW_ME ? "FOLLOW_ME" :
         nav.mode == NavMode::TEST      ? "TEST"      :
         nav.mode == NavMode::STOPPED   ? "STOPPED"   : "UNKNOWN",
@@ -584,10 +602,10 @@ void dashboard_update(float lps) {
         rtConfig.followDistanceCm, rtConfig.maxDistanceCm,
         rtConfig.targetSpeedMph,
         rtConfig.kp, rtConfig.ki, rtConfig.kd,
-        rtConfig.steeringKp, rtConfig.steeringKi, rtConfig.steeringMax,
+        rtConfig.steeringTrim, rtConfig.steeringKp, rtConfig.steeringKi, rtConfig.steeringMax,
         rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR, rtConfig.uwbOutlierRejectCm,
-        rtConfig.fusionQBearingPerSec, rtConfig.fusionRUwb,
-        rtConfig.fusionStaleUncertainty, rtConfig.fusionInnovEwmaAlpha,
+        rtConfig.sensorTimeoutSec, rtConfig.fusionRUwb, rtConfig.fusionRCamera,
+        rtConfig.fusionStaleUncertainty, rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha,
         _perf.imuAvg,  _perf.imuMax,
         _perf.uwbAvg,  _perf.uwbMax,
         _perf.navAvg,  _perf.navMax,

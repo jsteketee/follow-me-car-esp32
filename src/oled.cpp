@@ -79,10 +79,10 @@ static void screen_1(float lps, const NavData& nav, const Pose& fused, const Con
     _oledDisplay.println("/3");
 
     // _oledDisplay.print("TAG:");
-    // if (isnan(fused.angle)) {
+    // if (isnan(fused.fusedAngle)) {
     //     _oledDisplay.println("--");
     // } else {
-    //     _oledDisplay.print(fused.angle, 0);
+    //     _oledDisplay.print(fused.fusedAngle, 0);
     //     _oledDisplay.println();
     // }
 
@@ -90,7 +90,7 @@ static void screen_1(float lps, const NavData& nav, const Pose& fused, const Con
     _oledDisplay.print(nav.updateHz, 2);
     _oledDisplay.println("hz");
 
-    drawHeadingArrow(fused.angle, fused.distanceCm, fused.timestamp);
+    drawHeadingArrow(fused.fusedAngle, fused.distanceCm, fused.timestamp);
 
     if (fused.distanceCm >= 0) {
         char distBuf[8];
@@ -133,7 +133,7 @@ static void screen_2(float lps, const NavData& nav, const Pose& fused, const Con
     if (uncBarH > 0)
         _oledDisplay.fillRect(uncBarX, barFloor - uncBarH + 1, barW, uncBarH, SSD1306_WHITE);
 
-    drawHeadingArrow(fused.angle, fused.distanceCm, fused.timestamp);
+    drawHeadingArrow(fused.fusedAngle, fused.distanceCm, fused.timestamp);
 
     _oledDisplay.setTextSize(2);
     _oledDisplay.setTextColor(SSD1306_WHITE);

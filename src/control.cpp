@@ -54,7 +54,7 @@ static int float_to_pwm(float val) {
 }
 
 static void control_apply() {
-    float steering = constrain(_controlOutput.steering, -rtConfig.steeringMax, rtConfig.steeringMax);
+    float steering = constrain(_controlOutput.steering + rtConfig.steeringTrim, -rtConfig.steeringMax, rtConfig.steeringMax);
     escServo.writeMicroseconds(constrain(float_to_pwm(_controlOutput.throttle), PWM_MIN_US, PWM_MAX_US));
     steerServo.writeMicroseconds(constrain(float_to_pwm(steering), PWM_MIN_US, PWM_MAX_US));
 }
@@ -77,7 +77,7 @@ void control_update() {
     // Freeze angle at last valid reading so steering holds course during sensor dropout.
     static float _lastValidAngle = 0.0f;
     // if (nav.sensorsValid) {
-    _lastValidAngle = pose.angle;
+    _lastValidAngle = pose.fusedAngle;
     // }
 
     // Step 1 & 2: determine intent — set targetSpeed and steeringSetpoint
@@ -120,7 +120,7 @@ void control_update() {
     }
     if (!isnan(targetSpeed)) {
         if (pidTick) {
-            float pidOut = _throttlePid.update(targetSpeed, rpm_get().speedMph, dt);
+            float pidOut = _throttlePid.update(targetSpeed, pose.fusedSpeedMph, dt);
             float ffOut  = targetSpeed * rtConfig.throttleFfK;
             _controlOutput.throttle = rtConfig.throttleDeadband + constrain(pidOut + ffOut, 0.0f, 1.0f) * (rtConfig.throttleScale - rtConfig.throttleDeadband);
         }

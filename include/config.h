@@ -66,6 +66,16 @@
 // =============================================================================
 #define IMU_POLLING_INTERVAL_MS  10   // How often IMU is polled
 #define IMU_REPORT_INTERVAL_MS   10   // How often IMU reports data
+// #define IMU_ACCEL_PLOTTER           // Uncomment to stream lax/lay/laz to serial plotter
+
+// =============================================================================
+// Cogging Detection
+// =============================================================================
+#define COGGING_LAY_MEAN_ALPHA    0.05f  // smoothing for lay mean (~200ms window — tracks net direction)
+#define COGGING_LAY_VAR_ALPHA     0.10f  // smoothing for lay variance (~100ms window — tracks oscillation energy)
+#define COGGING_MEAN_THRESHOLD    0.5f   // max |mean| (m/s²) to qualify as near-zero net acceleration
+#define COGGING_VAR_THRESHOLD     4.0f   // min variance (m/s²)² to qualify as high-energy oscillation
+#define COGGING_HOLD_MS           500    // minimum time to hold cogging flag after last detection
 
 // =============================================================================
 // UWB
@@ -92,9 +102,9 @@
 // =============================================================================
 // Control
 // =============================================================================
-#define THROTTLE_SCALE      0.18f  // Max throttle (0.0–1.0)
-#define THROTTLE_Deadband   0.0f  // Minimum throttle before movement
-#define FOLLOW_DISTANCE_CM  150.0f // Distance at which throttle is 0
+#define THROTTLE_SCALE      0.22f  // Max throttle (0.0–1.0)
+#define THROTTLE_Deadband   0.05f  // Minimum throttle before movement
+#define FOLLOW_DISTANCE_CM  170.0f // Distance at which throttle is 0
 #define MAX_DISTANCE_CM     600.0f // Distance at which throttle is max
 #define DEFAULT_NAV_MODE       NavMode::FOLLOW_ME
 
@@ -127,9 +137,10 @@
 // =============================================================================
 // Fusion
 // =============================================================================
-#define FUSION_KALMAN_Q_BEARING_PER_SEC  25.0f  // bearing process noise (deg²/sec) — grows every loop, not just on fix arrival
+#define FUSION_SENSOR_TIMEOUT_SEC  3.0f   // seconds without a fix before uncertainty crosses the stale threshold
 #define FUSION_KALMAN_R_UWB     100.0f  // UWB bearing measurement noise (deg²) — lower = trust UWB more
 #define FUSION_KALMAN_R_CAMERA    4.0f  // camera bearing measurement noise (deg²) — lower = trust camera more
+#define FUSION_INNOV_MEAN_ALPHA   0.4f   // how fast the innovation mean tracks genuine movement; higher = faster tracking, less sensitive to real motion
 #define FUSION_INNOV_EWMA_ALPHA   0.15f  // innovation EWMA decay: higher = faster spike, faster recovery; lower = slower but smoother
 #define FUSION_STALE_UNCERTAINTY 200.0f // uncertainty (deg²) above which nav treats the estimate as stale (~2s without a fix)
 
