@@ -8,6 +8,6 @@ struct CameraData {
     unsigned long timestamp;
 };
 
-void camera_init();
+bool camera_init();   // returns true if camera found, false if not present
 void camera_update();
 const CameraData& camera_get();

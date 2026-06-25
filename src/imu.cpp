@@ -34,6 +34,7 @@ static void quaternionToEuler(float qw, float qx, float qy, float qz)
 static void enableReports()
 {
     bno.enableReport(SH2_ROTATION_VECTOR, IMU_REPORT_INTERVAL_MS * 1000);
+    bno.enableReport(SH2_LINEAR_ACCELERATION, IMU_REPORT_INTERVAL_MS * 1000);
     // bno.enableReport(SH2_ACCELEROMETER, IMU_REPORT_INTERVAL_MS * 1000);
     // bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_REPORT_INTERVAL_MS * 1000);
 }
@@ -124,11 +125,19 @@ void imu_update()
             }
             break;
         }
+        case SH2_LINEAR_ACCELERATION:
+            _imuData.lax = _sensorEvent.un.linearAcceleration.x;
+            _imuData.lay = _sensorEvent.un.linearAcceleration.y;
+            _imuData.laz = _sensorEvent.un.linearAcceleration.z;
+            _imuData.cal_accel = _sensorEvent.status & 0x03;
+            #ifdef IMU_ACCEL_PLOTTER
+            Serial.printf("lax:%.3f,lay:%.3f,laz:%.3f\n", _imuData.lax, _imuData.lay, _imuData.laz);
+            #endif
+            break;
         case SH2_ACCELEROMETER:
             _imuData.ax = _sensorEvent.un.accelerometer.x;
             _imuData.ay = _sensorEvent.un.accelerometer.y;
             _imuData.az = _sensorEvent.un.accelerometer.z;
-            _imuData.cal_accel = _sensorEvent.status & 0x03;
             break;
         case SH2_GYROSCOPE_CALIBRATED:
             _imuData.gx = _sensorEvent.un.gyroscope.x;

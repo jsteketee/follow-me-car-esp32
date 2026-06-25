@@ -18,6 +18,7 @@ static const char* TAG = "perf";
 static HzTracker   loopHz;
 
 static PerfTracker perfImu, perfUwb, perfNav, perfCtrl, perfOled, perfWifi;
+static bool        cameraOk = false;
 static uint32_t    lastReport = 0;
 
 static void perf_report(float lps) {
@@ -55,7 +56,7 @@ void setup()
     control_init();
     rpm_init();
     dashboard_init();
-    // camera_init();
+    cameraOk = camera_init();
     fusion_init();
 
     nav_set_mode(DEFAULT_NAV_MODE);
@@ -73,7 +74,7 @@ void loop()
 
     perfImu.begin();  imu_update();               perfImu.end();
     perfUwb.begin();  uwb_update();               perfUwb.end();
-    // camera_update();
+    if (cameraOk) camera_update();
     fusion_update();
     perfNav.begin();  nav_update();               perfNav.end();
     perfCtrl.begin(); control_update();           perfCtrl.end();

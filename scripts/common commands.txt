@@ -1,6 +1,11 @@
 pio run -e test --target upload
 sleep 2
 pio device monitor 
+==
+
+View the imu plotter:
+python3 scripts/imu_plotter.py 
+
 ===
 Connect to car wifi for terminal interface
 stty raw -echo && nc 192.168.4.1 23; stty -raw echo
@@ -9,6 +14,7 @@ Connect to dashboard
 WiFi: "Follow Me" (no password) → http://192.168.4.1/
 
 pio run -e test --target upload --upload-port 192.168.4.1
+
 
 ==
 Level	Macro	When to use

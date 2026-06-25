@@ -16,6 +16,7 @@ struct RuntimeConfig {
     float throttleFfK;
     float smoothAlpha;
     // Steering
+    float steeringTrim;
     float steeringKp;
     float steeringKi;
     float steeringMax;
@@ -24,9 +25,11 @@ struct RuntimeConfig {
     float uwbKalmanR;
     float uwbOutlierRejectCm;
     // Fusion
-    float fusionQBearingPerSec;
+    float sensorTimeoutSec;
     float fusionRUwb;
+    float fusionRCamera;
     float fusionStaleUncertainty;
+    float fusionInnovMeanAlpha;
     float fusionInnovEwmaAlpha;
 };
 

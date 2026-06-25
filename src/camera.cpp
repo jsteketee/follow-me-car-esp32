@@ -24,7 +24,7 @@ static void i2c_scan() {
     if (!found) ESP_LOGW(TAG, "  No I2C devices found");
 }
 
-void camera_init() {
+bool camera_init() {
     // Wire already started by oled_init(); pull-ups provided by OLED/IMU breakouts
     i2c_scan();
 
@@ -34,12 +34,13 @@ void camera_init() {
         Wire.beginTransmission(CAMERA_I2C_ADDR);
         if (Wire.endTransmission() == 0) {
             ESP_LOGI(TAG, "✅ Camera ready at I2C 0x%02X (attempt %d)", CAMERA_I2C_ADDR, i + 1);
-            return;
+            return true;
         }
         ESP_LOGD(TAG, "Camera not ready, retrying (%d/%d)...", i + 1, RETRIES);
         delay(500);
     }
-    ESP_LOGE(TAG, "❌ Camera not found at I2C 0x%02X after %d attempts", CAMERA_I2C_ADDR, RETRIES);
+    ESP_LOGE(TAG, "❌ Camera not found at I2C 0x%02X after %d attempts — disabled", CAMERA_I2C_ADDR, RETRIES);
+    return false;
 }
 
 void camera_update() {
