@@ -3,6 +3,8 @@
 #include "dashboard.h"
 #include "nav.h"
 #include "fusion.h"
+#include "uwb.h"
+#include "camera.h"
 #include "rpm.h"
 #include "imu.h"
 #include "control.h"
@@ -46,10 +48,19 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
 @media(max-width:600px){.cfg-row .card{flex:1 1 100%}}
 #dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#444;margin-right:7px;vertical-align:middle;transition:background 0.3s}
 #dot.on{background:#4f4}
+.pill{padding:2px 10px;border-radius:12px;font-size:0.8em;font-weight:bold;border:1px solid #444;color:#555}
+.pill.good{color:#4f4;border-color:#4f4;background:#0a200a}
+.pill.deg{color:#fa4;border-color:#fa4;background:#1a1000}
+.pill.lost{color:#f44;border-color:#f44;background:#1a0808}
 </style>
 </head>
 <body>
 <h1><span><span id="dot"></span>Follow-Me Car</span><span id="connStatus">Disconnected</span></h1>
+<div style="display:flex;gap:8px;margin-bottom:10px">
+  <span class="pill" id="pill-uwb">UWB</span>
+  <span class="pill" id="pill-cam">CAM</span>
+  <span class="pill" id="pill-fix">FIX</span>
+</div>
 <div class="row">
   <div class="card">
     <h2>Navigation</h2>
@@ -84,9 +95,19 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   <div class="card" style="flex:0 0 auto">
     <h2>Drive Mode</h2>
     <div style="display:flex;gap:8px">
-      <button class="btn" id="btn-FOLLOW_ME" onclick="setMode('FOLLOW_ME')">Follow Me</button>
-      <button class="btn" id="btn-TEST"      onclick="setMode('TEST')">Test</button>
-      <button class="btn" id="btn-STOPPED"   onclick="setMode('STOPPED')">Stopped</button>
+      <button class="btn" id="btn-FOLLOW_ME"    onclick="setMode('FOLLOW_ME')">Follow Me</button>
+      <button class="btn" id="btn-TEST"         onclick="setMode('TEST')">Test</button>
+      <button class="btn" id="btn-THROTTLE_TEST" onclick="setMode('THROTTLE_TEST')">Throttle Test</button>
+      <button class="btn" id="btn-STOPPED"      onclick="setMode('STOPPED')">Stopped</button>
+    </div>
+  </div>
+</div>
+<div class="row" id="throttleTestCard" style="display:none">
+  <div class="card">
+    <h2>Throttle Test Control</h2>
+    <div class="srow">
+      <label><span>Throttle — direct output (0 = neutral, 1 = full forward)</span><span id="v_tTh">0.00</span></label>
+      <input type="range" id="testThrottle" min="0.0" max="1.0" step="0.01" value="0">
     </div>
   </div>
 </div>
@@ -207,6 +228,7 @@ ws.onmessage = e => {
 
 function set(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
 function cls(id, c) { const el = document.getElementById(id); if (el) el.className = c; }
+function setPill(id, q) { const el = document.getElementById(id); if (el) el.className = 'pill ' + ['good','deg','lost'][q]; }
 
 const HISTORY = 100;
 const speedBuf    = new Array(HISTORY).fill(0);
@@ -217,10 +239,11 @@ const legendBounds  = [];
 
 function render(d) {
   const valid = d.navState === 'FOLLOW_ME';
-  ['FOLLOW_ME','TEST','STOPPED'].forEach(m => {
+  ['FOLLOW_ME','TEST','THROTTLE_TEST','STOPPED'].forEach(m => {
     const b = document.getElementById('btn-' + m);
     if (b) b.className = 'btn' + (d.navState === m ? ' active' : '');
   });
+  document.getElementById('throttleTestCard').style.display = d.navState === 'THROTTLE_TEST' ? '' : 'none';
   set('dist',     d.dist.toFixed(0) + ' cm');
   set('angle',    d.angle.toFixed(1) + '°');
   set('navState', d.navState);
@@ -255,6 +278,7 @@ function render(d) {
     slide('fusionStaleUncertainty',d.cfg.fSU,'v_fSU', v => v.toFixed(0));
     slide('fusionInnovMeanAlpha', d.cfg.fMa, 'v_fMa',  v => v.toFixed(2));
     slide('fusionInnovEwmaAlpha',d.cfg.fEa, 'v_fEa',  v => v.toFixed(3));
+    slide('testThrottle',        d.cfg.tTh, 'v_tTh',  v => v.toFixed(2));
     _targetSpeedMph = d.cfg.sp;
   }
   speedBuf.push(d.speed);
@@ -275,6 +299,9 @@ function render(d) {
   }
   drawArrow(thirdDeg, -d.steering * 90, valid, d.navState !== 'STOPPED', thirdLabel);
   if (d.perf) { _perfData = d.perf; drawPerfGraph(); }
+  setPill('pill-uwb', d.uwbQ);
+  setPill('pill-cam', d.camQ);
+  setPill('pill-fix', d.fixQ);
 }
 
 function slide(id, val, labelId, fmt) {
@@ -290,7 +317,8 @@ function setMode(m) {
 ['throttleScale','followDistanceCm','targetSpeedMph','kp','ki',
  'steeringTrim','steeringKp','steeringKi','steeringMax',
  'uwbKalmanQ','uwbKalmanR','uwbOutlierRejectCm',
- 'sensorTimeoutSec','fusionRUwb','fusionRCamera','fusionStaleUncertainty','fusionInnovMeanAlpha','fusionInnovEwmaAlpha'].forEach(id => {
+ 'sensorTimeoutSec','fusionRUwb','fusionRCamera','fusionStaleUncertainty','fusionInnovMeanAlpha','fusionInnovEwmaAlpha',
+ 'testThrottle'].forEach(id => {
   document.getElementById(id).addEventListener('change', () => {
     fetch('/config?key=' + id + '&value=' + document.getElementById(id).value, {method:'POST'});
   });
@@ -536,6 +564,7 @@ void dashboard_init() {
             else if (key == "fusionStaleUncertainty") rtConfig.fusionStaleUncertainty = val;
             else if (key == "fusionInnovMeanAlpha")   rtConfig.fusionInnovMeanAlpha   = val;
             else if (key == "fusionInnovEwmaAlpha")   rtConfig.fusionInnovEwmaAlpha   = val;
+            else if (key == "testThrottle")           rtConfig.testThrottle           = val;
             ESP_LOGI(TAG, "config %s = %.3f", key.c_str(), val);
         }
         req->send(200);
@@ -544,9 +573,10 @@ void dashboard_init() {
     _server.on("/mode", HTTP_POST, [](AsyncWebServerRequest* req) {
         if (req->hasParam("mode")) {
             String m = req->getParam("mode")->value();
-            if      (m == "FOLLOW_ME") nav_set_mode(NavMode::FOLLOW_ME);
-            else if (m == "TEST")    nav_set_mode(NavMode::TEST);
-            else if (m == "STOPPED") nav_set_mode(NavMode::STOPPED);
+            if      (m == "FOLLOW_ME")    nav_set_mode(NavMode::FOLLOW_ME);
+            else if (m == "TEST")         nav_set_mode(NavMode::TEST);
+            else if (m == "THROTTLE_TEST") nav_set_mode(NavMode::THROTTLE_TEST);
+            else if (m == "STOPPED")      nav_set_mode(NavMode::STOPPED);
             ESP_LOGI(TAG, "mode → %s", m.c_str());
         }
         req->send(200);
@@ -568,18 +598,29 @@ void dashboard_set_perf(const PerfData& p) { _perf = p; }
 
 void dashboard_update(float lps) {
     const NavData&       nav   = nav_get();
-    const Pose&     fused = fusion_get();
+    const Pose&          fused = fusion_get();
+    const UWBReading&    uwb   = uwb_get();
+    const CameraData&    cam   = camera_get();
     const RPMData&       rpm   = rpm_get();
     const ImuData&       imu   = imu_get();
     const ControlOutput& ctrl  = control_get();
+
+    uint32_t nowMs   = millis();
+    uint32_t uwbAge  = nowMs - uwb.timestamp;
+    uint32_t camAge  = nowMs - cam.timestamp;
+    int uwbQ = uwbAge < 500 ? 0 : uwbAge < 1500 ? 1 : 2;
+    int camQ = (cam.found && camAge < 200) ? 0 : camAge < 500 ? 1 : 2;
+    int fixQ = fused.uncertainty < rtConfig.fusionStaleUncertainty * 0.5f ? 0 :
+               fused.uncertainty < rtConfig.fusionStaleUncertainty        ? 1 : 2;
     float dt;
     if (!_gate.tick(dt)) return;
 
     _webSocket.cleanupClients();
 
-    char buf[1200];
+    char buf[1300];
     snprintf(buf, sizeof(buf),
         "{\"dist\":%.1f,\"angle\":%.1f,\"headingHold\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
+        "\"uwbQ\":%d,\"camQ\":%d,\"fixQ\":%d,"
         "\"speed\":%.3f,\"rpm\":%.0f,"
         "\"heading\":%.1f,\"cal_rot\":%u,\"cal_acc\":%u,"
         "\"throttle\":%.3f,\"steering\":%.3f,\"lps\":%.0f,"
@@ -587,14 +628,17 @@ void dashboard_update(float lps) {
         "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,"
         "\"sTr\":%.3f,\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
         "\"uQ\":%.2f,\"uR\":%.2f,\"uOr\":%.1f,"
-        "\"fT\":%.2f,\"fR\":%.1f,\"fRc\":%.1f,\"fSU\":%.1f,\"fMa\":%.3f,\"fEa\":%.4f},"
+        "\"fT\":%.2f,\"fR\":%.1f,\"fRc\":%.1f,\"fSU\":%.1f,\"fMa\":%.3f,\"fEa\":%.4f,"
+        "\"tTh\":%.3f},"
         "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,\"na\":%u,\"nm\":%u,"
         "\"ca\":%u,\"cm\":%u,\"oa\":%u,\"om\":%u,\"wa\":%u,\"wm\":%u}}",
         safeF(fused.distanceCm), safeF(fused.fusedAngle), safeF(nav.headingHold),
-        nav.mode == NavMode::FOLLOW_ME ? "FOLLOW_ME" :
-        nav.mode == NavMode::TEST      ? "TEST"      :
-        nav.mode == NavMode::STOPPED   ? "STOPPED"   : "UNKNOWN",
+        nav.mode == NavMode::FOLLOW_ME    ? "FOLLOW_ME"    :
+        nav.mode == NavMode::TEST         ? "TEST"         :
+        nav.mode == NavMode::THROTTLE_TEST ? "THROTTLE_TEST" :
+        nav.mode == NavMode::STOPPED      ? "STOPPED"      : "UNKNOWN",
         safeF(rpm.odometryCm),
+        uwbQ, camQ, fixQ,
         safeF(rpm.speedMph), safeF(rpm.rpm),
         safeF(imu.yaw), imu.cal_rot, imu.cal_accel,
         safeF(ctrl.throttle), safeF(ctrl.steering), safeF(lps),
@@ -606,6 +650,7 @@ void dashboard_update(float lps) {
         rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR, rtConfig.uwbOutlierRejectCm,
         rtConfig.sensorTimeoutSec, rtConfig.fusionRUwb, rtConfig.fusionRCamera,
         rtConfig.fusionStaleUncertainty, rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha,
+        rtConfig.testThrottle,
         _perf.imuAvg,  _perf.imuMax,
         _perf.uwbAvg,  _perf.uwbMax,
         _perf.navAvg,  _perf.navMax,

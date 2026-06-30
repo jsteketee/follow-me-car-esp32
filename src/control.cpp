@@ -105,6 +105,12 @@ void control_update() {
             steeringMeasure  = _lastValidAngle;
             targetSpeed = rtConfig.targetSpeedMph;
             break;
+        case NavMode::THROTTLE_TEST:
+            // Direct throttle control — bypass PID and smoothing
+            _controlOutput.throttle = rtConfig.testThrottle;
+            _controlOutput.steering = 0.0f;
+            control_apply();
+            return;
         case NavMode::STOPPED:
             break;
     }
@@ -131,11 +137,7 @@ void control_update() {
     }
 
     static float _smoothThrottle = 0.0f;
-    if (nav.sensorsValid) {
-        _smoothThrottle += rtConfig.smoothAlpha * (_controlOutput.throttle - _smoothThrottle);
-    } else {
-        _smoothThrottle = 0.0f;
-    }
+    _smoothThrottle += rtConfig.smoothAlpha * (_controlOutput.throttle - _smoothThrottle);
     _controlOutput.throttle = _smoothThrottle;
 
     control_apply();

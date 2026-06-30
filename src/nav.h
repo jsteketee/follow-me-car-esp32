@@ -4,6 +4,7 @@
 enum class NavMode {
     FOLLOW_ME,
     TEST,
+    THROTTLE_TEST,
     STOPPED,
 };
 

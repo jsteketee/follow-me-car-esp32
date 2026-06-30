@@ -24,4 +24,5 @@ RuntimeConfig rtConfig = {
     .fusionStaleUncertainty = FUSION_STALE_UNCERTAINTY,
     .fusionInnovMeanAlpha   = FUSION_INNOV_MEAN_ALPHA,
     .fusionInnovEwmaAlpha   = FUSION_INNOV_EWMA_ALPHA,
+    .testThrottle           = 0.0f,
 };

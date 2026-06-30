@@ -31,6 +31,8 @@ struct RuntimeConfig {
     float fusionStaleUncertainty;
     float fusionInnovMeanAlpha;
     float fusionInnovEwmaAlpha;
+    // Throttle test
+    float testThrottle;
 };
 
 extern RuntimeConfig rtConfig;

@@ -124,7 +124,7 @@
 // =============================================================================
 #define CONTROL_UPDATE_INTERVAL_MS  20     // PID update rate (50 Hz)
 #define THROTTLE_SMOOTH_ALPHA       0.05f  // Exponential smoothing on throttle output (0=frozen, 1=no smoothing)
-#define THROTTLE_PID_TARGET_MPH     2.0f   // target follow speed
+#define THROTTLE_PID_TARGET_MPH     2.5f   // target follow speed
 #define THROTTLE_PID_KP             4.0f
 #define THROTTLE_PID_KI             0.5f
 #define THROTTLE_PID_KD             0.0f
