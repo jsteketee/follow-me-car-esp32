@@ -97,13 +97,16 @@ void control_update() {
             //Todo Need to integrate heading change and use to adjust steering between waypoint measurements.
             steeringSetpoint = 0.0f;
             steeringMeasure  = _lastValidAngle;
-            if (nav.sensorsValid && pose.distanceCm > rtConfig.followDistanceCm)
-                targetSpeed = rtConfig.targetSpeedMph;
+            if (nav.sensorsValid && pose.distanceCm > rtConfig.followDistanceCm) {
+                float t = constrain((pose.distanceCm - rtConfig.followDistanceCm) /
+                                    (rtConfig.maxDistanceCm - rtConfig.followDistanceCm), 0.0f, 1.0f);
+                targetSpeed = rtConfig.minSpeedMph + t * (rtConfig.maxSpeedMph - rtConfig.minSpeedMph);
+            }
             break;
         case NavMode::TEST:
             steeringSetpoint = 0.0f;
             steeringMeasure  = _lastValidAngle;
-            targetSpeed = rtConfig.targetSpeedMph;
+            targetSpeed = rtConfig.maxSpeedMph;
             break;
         case NavMode::THROTTLE_TEST:
             // Direct throttle control — bypass PID and smoothing
@@ -124,6 +127,7 @@ void control_update() {
         _steeringPid.reset();
         _controlOutput.steering = 0.0f;
     }
+    _controlOutput.targetSpeedMph = isnan(targetSpeed) ? 0.0f : targetSpeed;
     if (!isnan(targetSpeed)) {
         if (pidTick) {
             float pidOut = _throttlePid.update(targetSpeed, pose.fusedSpeedMph, dt);

@@ -23,7 +23,7 @@ static uint32_t    lastReport = 0;
 
 static void perf_report(float lps) {
     if (millis() - lastReport < 1000) return;
-    ESP_LOGI(TAG, "lps=%.0f  imu=%u/%u  uwb=%u/%u  nav=%u/%u  ctrl=%u/%u  oled=%u/%u  wifi=%u/%u  (avg/max us)",
+    Serial.printf("[perf] lps=%.0f  imu=%u/%u  uwb=%u/%u  nav=%u/%u  ctrl=%u/%u  oled=%u/%u  wifi=%u/%u  (avg/max us)\n",
         lps,
         perfImu.avg(),  perfImu.maxUs,
         perfUwb.avg(),  perfUwb.maxUs,
@@ -56,16 +56,13 @@ void setup()
     control_init();
     rpm_init();
     dashboard_init();
+#ifndef CAMERA_DISABLED
     cameraOk = camera_init();
+#endif
     fusion_init();
 
     nav_set_mode(DEFAULT_NAV_MODE);
     Serial.println("⭐⭐⭐⭐⭐ Setup Complete ⭐⭐⭐⭐⭐");
-    if (UWB_DIAGNOSTICS_ON_STARTUP){
-        Serial.println("⭐⭐⭐⭐⭐ Running UWB Diagnostics ⭐⭐⭐⭐⭐");
-        uwb_run_diagnostics();
-        Serial.println("⭐⭐⭐⭐⭐ Diagnostics Complete ⭐⭐⭐⭐⭐");
-    }
 }
 
 void loop()
@@ -74,7 +71,9 @@ void loop()
 
     perfImu.begin();  imu_update();               perfImu.end();
     perfUwb.begin();  uwb_update();               perfUwb.end();
+#ifndef CAMERA_DISABLED
     if (cameraOk) camera_update();
+#endif
     fusion_update();
     perfNav.begin();  nav_update();               perfNav.end();
     perfCtrl.begin(); control_update();           perfCtrl.end();

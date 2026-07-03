@@ -8,14 +8,9 @@
 #define PIN_SDA               8
 #define PIN_SCL               9
 
-// UWB UART
-#define PIN_UWB_LEFT_TX      17
-#define PIN_UWB_LEFT_RX      18
-#define PIN_UWB_RIGHT_TX     38
-#define PIN_UWB_RIGHT_RX     39
-#define PIN_UWB_FRONT_TX     15
-#define PIN_UWB_FRONT_RX     16
-#define PIN_UWB_NRST         21
+// DW3000 UWB UART
+#define PIN_DW3000_RX         4
+#define PIN_DW3000_TX         5
 
 // Camera I2C (shares Wire bus with OLED/IMU — pull-ups provided by those breakouts)
 #define PIN_CAMERA_SDA        8
@@ -78,35 +73,28 @@
 #define COGGING_HOLD_MS           500    // minimum time to hold cogging flag after last detection
 
 // =============================================================================
-// UWB
+// UWB — Makerfabs DW3000 AOA anchor (Qorvo DW3000, STM32F103C8T6)
 // =============================================================================
-#define UWB_TAG_ADDRESS             "TAG"
-#define UWB_RESPONSE_TIMEOUT_MS      100   // 2.5x typical ~75ms response time
-#define UWB_POLL_INTERVAL_MS           0   // Start next cycle immediately after previous completes
-#define UWB_CAL_POLL_INTERVAL_MS     250   // Poll interval during calibration
-#define UWB_ANCHOR_SEPARATION_CM    30.0f  // Physical separation between left and right anchors
-#define UWB_CALIBRATION_DISTANCE_CM 185.0f  // Known distance used during startup calibration
-#define UWB_CALIBRATION_SAMPLES       20   // Number of ranging samples per anchor for calibration
-#define UWB_CALIBRATE_ON_STARTUP    false  // Run anchor calibration on startup
-#define UWB_DIAGNOSTICS_ON_STARTUP  false  // Run 30s per-anchor diagnostic test on startup
-#define UWB_KALMAN_Q                 8.0f  // Process noise
-#define UWB_KALMAN_R                75.0f  // Measurement noise variance
-#define UWB_OUTLIER_REJECT_CM       30.0f  // Reject single-poll distance jumps larger than this
-#define UWB_OUTLIER_MAX_STREAK          3  // Force-accept after this many consecutive rejections
-#define UWB_STALE_HEADING_MS         1500  // Age after which heading is stale; outlier rejection is bypassed
-#define UWB_FRONT_X_CM              0.0f  // lateral position of front anchor (right-positive; left = negative)
-#define UWB_FRONT_Y_CM              15.3f  // forward position of front anchor from left/right anchor line
-#define UWB_FRONT_FLIP_ABRUPT_DEG  90.0f  // heading change above this is considered abrupt and requires streak confirmation
-#define UWB_FRONT_FLIP_CONFIRM         3  // consecutive abrupt-flip readings required before latch flips
+#define DW3000_BAUD            115200
+// Multiply raw int32 angle field by this to get degrees.
+// Set to 0.01f if firmware reports degrees*100 (verify from first-flash log).
+#define DW3000_ANGLE_SCALE     1.0f
+#define UWB_KALMAN_Q           8.0f  // Distance filter process noise; ~3 cm/frame allows tracking at walking speed
+#define UWB_KALMAN_R          20.0f  // Distance filter measurement noise; stationary test: σ≈4cm → σ²≈14-20 cm²
+#define UWB_OUTLIER_REJECT_CM 30.0f  // Reject single-frame distance jumps larger than this
+#define UWB_OUTLIER_MAX_STREAK    3  // Force-accept after this many consecutive rejections
 
 // =============================================================================
 // Control
 // =============================================================================
 #define THROTTLE_SCALE      0.22f  // Max throttle (0.0–1.0)
 #define THROTTLE_Deadband   0.05f  // Minimum throttle before movement
-#define FOLLOW_DISTANCE_CM  170.0f // Distance at which throttle is 0
-#define MAX_DISTANCE_CM     600.0f // Distance at which throttle is max
+#define FOLLOW_DISTANCE_CM  200.0f // Distance at which car stops
+#define MAX_DISTANCE_CM     800.0f // Distance at which car runs at max speed
+#define MIN_SPEED_MPH 1.0f  // speed when tag is just past follow distance
+#define MAX_SPEED_MPH 2.5f  // speed when tag is at or beyond max distance
 #define DEFAULT_NAV_MODE       NavMode::FOLLOW_ME
+
 
 // =============================================================================
 // RPM
@@ -124,7 +112,6 @@
 // =============================================================================
 #define CONTROL_UPDATE_INTERVAL_MS  20     // PID update rate (50 Hz)
 #define THROTTLE_SMOOTH_ALPHA       0.05f  // Exponential smoothing on throttle output (0=frozen, 1=no smoothing)
-#define THROTTLE_PID_TARGET_MPH     2.5f   // target follow speed
 #define THROTTLE_PID_KP             4.0f
 #define THROTTLE_PID_KI             0.5f
 #define THROTTLE_PID_KD             0.0f
@@ -138,11 +125,11 @@
 // Fusion
 // =============================================================================
 #define FUSION_SENSOR_TIMEOUT_SEC  3.0f   // seconds without a fix before uncertainty crosses the stale threshold
-#define FUSION_KALMAN_R_UWB     100.0f  // UWB bearing measurement noise (deg²) — lower = trust UWB more
+#define FUSION_KALMAN_R_UWB      15.0f  // UWB bearing measurement noise (deg²); stationary test: σ≈3-4° → σ²≈10-15
 #define FUSION_KALMAN_R_CAMERA    4.0f  // camera bearing measurement noise (deg²) — lower = trust camera more
 #define FUSION_INNOV_MEAN_ALPHA   0.4f   // how fast the innovation mean tracks genuine movement; higher = faster tracking, less sensitive to real motion
 #define FUSION_INNOV_EWMA_ALPHA   0.15f  // innovation EWMA decay: higher = faster spike, faster recovery; lower = slower but smoother
-#define FUSION_STALE_UNCERTAINTY 200.0f // uncertainty (deg²) above which nav treats the estimate as stale (~2s without a fix)
+#define FUSION_STALE_UNCERTAINTY 150.0f // uncertainty (deg²) above which nav treats the estimate as stale; steady state ~17, erratic movement ~120
 
 // =============================================================================
 // Misc

@@ -90,6 +90,10 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
     <h2>Heading</h2>
     <canvas id="arrow" width="180" height="180"></canvas>
   </div>
+  <div class="card" style="max-width:220px">
+    <h2>Position</h2>
+    <canvas id="posView"></canvas>
+  </div>
 </div>
 <div class="row">
   <div class="card" style="flex:0 0 auto">
@@ -121,12 +125,20 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   <div class="card">
     <h2>Throttle</h2>
     <div class="srow">
-      <label><span>Target Speed — speed setpoint while following</span><span id="v_sp">--</span></label>
-      <input type="range" id="targetSpeedMph" min="0.5" max="4.0" step="0.1">
+      <label><span>Min Speed — speed at follow distance</span><span id="v_mnSp">--</span></label>
+      <input type="range" id="minSpeedMph" min="0.3" max="4.0" step="0.1">
+    </div>
+    <div class="srow">
+      <label><span>Max Speed — speed at max distance</span><span id="v_mxSp">--</span></label>
+      <input type="range" id="maxSpeedMph" min="0.3" max="4.0" step="0.1">
     </div>
     <div class="srow">
       <label><span>Follow Distance — stop below this</span><span id="v_fd">--</span></label>
       <input type="range" id="followDistanceCm" min="50" max="400" step="10">
+    </div>
+    <div class="srow">
+      <label><span>Max Distance — full speed beyond this</span><span id="v_md">--</span></label>
+      <input type="range" id="maxDistanceCm" min="100" max="800" step="10">
     </div>
     <div class="srow">
       <label><span>Throttle Scale — max PWM output cap</span><span id="v_ts">--</span></label>
@@ -232,8 +244,9 @@ function setPill(id, q) { const el = document.getElementById(id); if (el) el.cla
 
 const HISTORY = 100;
 const speedBuf    = new Array(HISTORY).fill(0);
+const targetBuf   = new Array(HISTORY).fill(0);
 const throttleBuf = new Array(HISTORY).fill(0);
-let _targetSpeedMph = 0;
+let _maxSpeedMph = 0;
 const seriesVisible = { speed: true, target: true, throttle: true };
 const legendBounds  = [];
 
@@ -260,8 +273,10 @@ function render(d) {
   set('cal_acc',  d.cal_acc + '/3');
   set('lps',      d.lps.toFixed(0));
   if (d.cfg) {
-    slide('targetSpeedMph',      d.cfg.sp,  'v_sp',   v => v.toFixed(1) + ' mph');
+    slide('minSpeedMph',         d.cfg.mnSp,'v_mnSp', v => v.toFixed(1) + ' mph');
+    slide('maxSpeedMph',         d.cfg.mxSp,'v_mxSp', v => v.toFixed(1) + ' mph');
     slide('followDistanceCm',    d.cfg.fd,  'v_fd',   v => v.toFixed(0) + ' cm');
+    slide('maxDistanceCm',       d.cfg.md,  'v_md',   v => v.toFixed(0) + ' cm');
     slide('throttleScale',       d.cfg.ts,  'v_ts',   v => v.toFixed(3));
     slide('kp',                  d.cfg.kp,  'v_kp',   v => v.toFixed(2));
     slide('ki',                  d.cfg.ki,  'v_ki',   v => v.toFixed(3));
@@ -279,10 +294,12 @@ function render(d) {
     slide('fusionInnovMeanAlpha', d.cfg.fMa, 'v_fMa',  v => v.toFixed(2));
     slide('fusionInnovEwmaAlpha',d.cfg.fEa, 'v_fEa',  v => v.toFixed(3));
     slide('testThrottle',        d.cfg.tTh, 'v_tTh',  v => v.toFixed(2));
-    _targetSpeedMph = d.cfg.sp;
+    _maxSpeedMph = d.cfg.mxSp;
   }
   speedBuf.push(d.speed);
   speedBuf.shift();
+  targetBuf.push(d.tSp || 0);
+  targetBuf.shift();
   throttleBuf.push(d.cfg.ts > 0 ? d.throttle / d.cfg.ts : d.throttle);
   throttleBuf.shift();
   drawSpeedGraph();
@@ -298,6 +315,7 @@ function render(d) {
     thirdLabel = 'Target';
   }
   drawArrow(thirdDeg, -d.steering * 90, valid, d.navState !== 'STOPPED', thirdLabel);
+  drawPosView(d.dist, d.angle, d.uwbQ < 2 ? d.uwbAngle : null, d.uwbDist || -1, d.cfg ? d.cfg.fd : 170, d.fixQ);
   if (d.perf) { _perfData = d.perf; drawPerfGraph(); }
   setPill('pill-uwb', d.uwbQ);
   setPill('pill-cam', d.camQ);
@@ -314,7 +332,7 @@ function setMode(m) {
   fetch('/mode?mode=' + m, {method:'POST'});
 }
 
-['throttleScale','followDistanceCm','targetSpeedMph','kp','ki',
+['throttleScale','minSpeedMph','maxSpeedMph','followDistanceCm','maxDistanceCm','kp','ki',
  'steeringTrim','steeringKp','steeringKi','steeringMax',
  'uwbKalmanQ','uwbKalmanR','uwbOutlierRejectCm',
  'sensorTimeoutSec','fusionRUwb','fusionRCamera','fusionStaleUncertainty','fusionInnovMeanAlpha','fusionInnovEwmaAlpha',
@@ -345,7 +363,7 @@ function drawSpeedGraph() {
   graphCanvas.width = w; graphCanvas.height = h;
   const pad = 4;
   gctx.clearRect(0, 0, w, h);
-  const maxVal = Math.max(5, _targetSpeedMph, ...speedBuf);
+  const maxVal = Math.max(5, _maxSpeedMph, ...speedBuf);
   gctx.strokeStyle = '#333';
   gctx.lineWidth = 1;
   gctx.beginPath(); gctx.moveTo(pad, pad); gctx.lineTo(pad, h-pad); gctx.lineTo(w-pad, h-pad); gctx.stroke();
@@ -362,18 +380,24 @@ function drawSpeedGraph() {
     gctx.strokeStyle = major ? '#555' : '#2d2d2d';
     gctx.beginPath(); gctx.moveTo(x, h-pad); gctx.lineTo(x, h-pad-(major ? 6 : 3)); gctx.stroke();
   }
-  // Target speed reference line (dashed gray)
-  if (_targetSpeedMph > 0 && seriesVisible.target) {
-    const ty = h - pad - (_targetSpeedMph / maxVal) * (h - pad * 2);
-    gctx.setLineDash([4, 4]);
+  // Target speed line — drawn as a polyline so it tracks the interpolated setpoint
+  if (seriesVisible.target) {
     gctx.strokeStyle = '#666';
     gctx.lineWidth = 1;
-    gctx.beginPath(); gctx.moveTo(sl, ty); gctx.lineTo(sl + sw, ty); gctx.stroke();
+    gctx.setLineDash([4, 4]);
+    gctx.beginPath();
+    targetBuf.forEach((v, i) => {
+      const x = sl + (i / (HISTORY - 1)) * sw;
+      const y = h - pad - (v / maxVal) * (h - pad * 2);
+      i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
+    });
+    gctx.stroke();
+    gctx.setLineDash([]);
   }
-  gctx.setLineDash([]);
-  // 10s error label
-  const avgSpeed = speedBuf.reduce((a, b) => a + b, 0) / speedBuf.length;
-  const avgError = avgSpeed - _targetSpeedMph;
+  // 10s error label — compare against most recent target, not max
+  const avgSpeed  = speedBuf.reduce((a, b) => a + b, 0) / speedBuf.length;
+  const avgTarget = targetBuf.reduce((a, b) => a + b, 0) / targetBuf.length;
+  const avgError  = avgSpeed - avgTarget;
   gctx.fillStyle = '#fa4';
   gctx.font = 'bold 14px monospace';
   gctx.fillText('10s err: ' + (avgError >= 0 ? '+' : '') + avgError.toFixed(2), sl + 4, pad + 14);
@@ -485,6 +509,88 @@ function drawArrow(targetDeg, steeringDeg, valid, targetActive, thirdLabel) {
   ctx.textAlign = 'left';
 }
 
+const posCanvas = document.getElementById('posView');
+const posCtx    = posCanvas.getContext('2d');
+function drawPosView(dist, angleDeg, uwbAngleDeg, uwbDist, followDistCm, fixQ) {
+  const w = posCanvas.offsetWidth || 200;
+  posCanvas.width = w; posCanvas.height = w;
+  const cx = w / 2, cy = w / 2;
+  const LEGEND_H = 18;
+  posCtx.clearRect(0, 0, w, w);
+
+  // Auto-scale: fit current dist or 1.5× follow distance, whichever is larger
+  const viewR = Math.max(dist > 0 ? dist * 1.3 : followDistCm * 2, followDistCm * 1.5, 150);
+  const scale = (w * 0.42) / viewR;
+
+  // Nice ring step: aim for ~4 rings
+  const mag  = Math.pow(10, Math.floor(Math.log10(viewR / 4)));
+  const norm = (viewR / 4) / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3.5 ? 2 : 5) * mag;
+
+  // Range rings + labels
+  posCtx.lineWidth = 1;
+  for (let r = step; r < viewR * 1.1; r += step) {
+    posCtx.strokeStyle = '#252525';
+    posCtx.beginPath(); posCtx.arc(cx, cy, r * scale, 0, Math.PI * 2); posCtx.stroke();
+    posCtx.fillStyle = '#333'; posCtx.font = '9px monospace'; posCtx.textAlign = 'right';
+    posCtx.fillText((r / 100).toFixed(r < 100 ? 1 : 0) + 'm', cx - 3, cy - r * scale + 9);
+  }
+
+  // Stop-distance ring (dashed — car holds position inside this)
+  posCtx.strokeStyle = '#1c3020'; posCtx.lineWidth = 1; posCtx.setLineDash([4, 4]);
+  posCtx.beginPath(); posCtx.arc(cx, cy, followDistCm * scale, 0, Math.PI * 2); posCtx.stroke();
+  posCtx.setLineDash([]);
+
+  // Forward axis
+  posCtx.strokeStyle = '#1e281e'; posCtx.lineWidth = 1;
+  posCtx.beginPath(); posCtx.moveTo(cx, cy - w*0.46); posCtx.lineTo(cx, cy + w*0.46); posCtx.stroke();
+
+  // "FWD" label
+  posCtx.fillStyle = '#333'; posCtx.font = '9px monospace'; posCtx.textAlign = 'center';
+  posCtx.fillText('FWD', cx, 10);
+
+  // Car icon — small triangle pointing up
+  posCtx.fillStyle = '#4af';
+  posCtx.beginPath(); posCtx.moveTo(cx, cy-9); posCtx.lineTo(cx-5, cy+5); posCtx.lineTo(cx+5, cy+5); posCtx.closePath(); posCtx.fill();
+
+  function plotDot(angleDeg, dotDist, radius, color, alpha) {
+    const rad = angleDeg * Math.PI / 180;
+    const tx  = cx + dotDist * scale * Math.sin(rad);
+    const ty  = cy - dotDist * scale * Math.cos(rad);
+    posCtx.strokeStyle = color; posCtx.globalAlpha = 0.25; posCtx.lineWidth = 1;
+    posCtx.beginPath(); posCtx.moveTo(cx, cy); posCtx.lineTo(tx, ty); posCtx.stroke();
+    posCtx.globalAlpha = alpha;
+    posCtx.fillStyle = color;
+    posCtx.beginPath(); posCtx.arc(tx, ty, radius, 0, Math.PI * 2); posCtx.fill();
+    posCtx.globalAlpha = 1.0;
+    return {tx, ty};
+  }
+
+  const fusedCol = fixQ === 0 ? '#4f4' : fixQ === 1 ? '#fa4' : '#f44';
+
+  if (dist > 0) {
+    // Raw UWB dot (cyan, drawn first so fused renders on top)
+    if (uwbAngleDeg !== null && uwbDist > 0) plotDot(uwbAngleDeg, uwbDist, 4, '#4af', 0.85);
+
+    // Fused dot (semi-transparent so raw dot shows through when they overlap)
+    plotDot(angleDeg, dist, 6, fusedCol, 0.7);
+
+    // Distance + angle readout (top-left)
+    posCtx.fillStyle = fusedCol; posCtx.font = 'bold 10px monospace'; posCtx.textAlign = 'left';
+    posCtx.fillText(dist.toFixed(0) + ' cm', 4, 12);
+    posCtx.fillText((angleDeg >= 0 ? '+' : '') + angleDeg.toFixed(1) + '°', 4, 23);
+  }
+
+  // Legend — fused color matches the dot (tracks fixQ), UWB is always cyan
+  posCtx.font = '10px monospace'; posCtx.textAlign = 'left';
+  const ly = w - 4;
+  posCtx.fillStyle = fusedCol; posCtx.fillRect(4,     ly-9, 8, 8);
+  posCtx.fillStyle = '#aaa';   posCtx.fillText('Fused', 15,   ly);
+  posCtx.fillStyle = '#4af';   posCtx.fillRect(w/2+4, ly-9, 8, 8);
+  posCtx.fillStyle = '#aaa';   posCtx.fillText('UWB',  w/2+15, ly);
+  posCtx.textAlign = 'left';
+}
+
 let _perfData = null;
 let _perfMode = 'avg';
 function setPerfMode(m) {
@@ -547,7 +653,8 @@ void dashboard_init() {
             else if (key == "throttleFfK")            rtConfig.throttleFfK            = val;
             else if (key == "followDistanceCm")       rtConfig.followDistanceCm       = val;
             else if (key == "maxDistanceCm")          rtConfig.maxDistanceCm          = val;
-            else if (key == "targetSpeedMph")         rtConfig.targetSpeedMph         = val;
+            else if (key == "minSpeedMph")            rtConfig.minSpeedMph            = val;
+            else if (key == "maxSpeedMph")            rtConfig.maxSpeedMph            = val;
             else if (key == "kp")                     rtConfig.kp                     = val;
             else if (key == "ki")                     rtConfig.ki                     = val;
             else if (key == "kd")                     rtConfig.kd                     = val;
@@ -617,14 +724,14 @@ void dashboard_update(float lps) {
 
     _webSocket.cleanupClients();
 
-    char buf[1300];
+    char buf[1350];
     snprintf(buf, sizeof(buf),
-        "{\"dist\":%.1f,\"angle\":%.1f,\"headingHold\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
+        "{\"dist\":%.1f,\"angle\":%.1f,\"uwbAngle\":%.1f,\"uwbDist\":%.1f,\"headingHold\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
         "\"uwbQ\":%d,\"camQ\":%d,\"fixQ\":%d,"
         "\"speed\":%.3f,\"rpm\":%.0f,"
         "\"heading\":%.1f,\"cal_rot\":%u,\"cal_acc\":%u,"
-        "\"throttle\":%.3f,\"steering\":%.3f,\"lps\":%.0f,"
-        "\"cfg\":{\"ts\":%.3f,\"sa\":%.3f,\"tff\":%.3f,\"fd\":%.0f,\"md\":%.0f,\"sp\":%.2f,"
+        "\"throttle\":%.3f,\"steering\":%.3f,\"tSp\":%.3f,\"lps\":%.0f,"
+        "\"cfg\":{\"ts\":%.3f,\"sa\":%.3f,\"tff\":%.3f,\"fd\":%.0f,\"md\":%.0f,\"mnSp\":%.2f,\"mxSp\":%.2f,"
         "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,"
         "\"sTr\":%.3f,\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
         "\"uQ\":%.2f,\"uR\":%.2f,\"uOr\":%.1f,"
@@ -632,7 +739,7 @@ void dashboard_update(float lps) {
         "\"tTh\":%.3f},"
         "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,\"na\":%u,\"nm\":%u,"
         "\"ca\":%u,\"cm\":%u,\"oa\":%u,\"om\":%u,\"wa\":%u,\"wm\":%u}}",
-        safeF(fused.distanceCm), safeF(fused.fusedAngle), safeF(nav.headingHold),
+        safeF(fused.distanceCm), safeF(fused.fusedAngle), safeF(fused.uwbAngle), safeF(fused.uwbDistCm), safeF(nav.headingHold),
         nav.mode == NavMode::FOLLOW_ME    ? "FOLLOW_ME"    :
         nav.mode == NavMode::TEST         ? "TEST"         :
         nav.mode == NavMode::THROTTLE_TEST ? "THROTTLE_TEST" :
@@ -641,10 +748,10 @@ void dashboard_update(float lps) {
         uwbQ, camQ, fixQ,
         safeF(rpm.speedMph), safeF(rpm.rpm),
         safeF(imu.yaw), imu.cal_rot, imu.cal_accel,
-        safeF(ctrl.throttle), safeF(ctrl.steering), safeF(lps),
+        safeF(ctrl.throttle), safeF(ctrl.steering), safeF(ctrl.targetSpeedMph), safeF(lps),
         rtConfig.throttleScale, rtConfig.smoothAlpha, rtConfig.throttleFfK,
         rtConfig.followDistanceCm, rtConfig.maxDistanceCm,
-        rtConfig.targetSpeedMph,
+        rtConfig.minSpeedMph, rtConfig.maxSpeedMph,
         rtConfig.kp, rtConfig.ki, rtConfig.kd,
         rtConfig.steeringTrim, rtConfig.steeringKp, rtConfig.steeringKi, rtConfig.steeringMax,
         rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR, rtConfig.uwbOutlierRejectCm,

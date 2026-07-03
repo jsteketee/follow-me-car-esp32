@@ -1,364 +1,150 @@
-// UWB ranging driver for RYUW122 anchors. All communication uses raw AT commands.
-// Per-anchor Kalman filtering and outlier rejection; exposes distLeft/distRight (filtered) and distFast (raw avg).
+// DW3000 AOA UWB driver.
+// Reads binary "carfollow" frames from a Makerfabs DW3000 anchor over UART.
+// Frame format: 0x2A | length | payload (sn, addr, angle int32 LE, distCm int32 LE, ...) | XOR checksum | 0x23
+// No handshake needed — anchor is pre-configured to USER_CMD 1 (binary mode) and paired with the tag.
 
 #include "uwb.h"
 #include "config.h"
 #include "runtime_config.h"
 #include "utils.h"
-#include "wifi_config.h"
 #include "esp_log.h"
 #include <math.h>
 
-static const char *TAG = "uwb";
+static const char* TAG = "uwb";
 
-static HardwareSerial uartFront(0);
+static HardwareSerial _dwSerial(1);
 
-enum class PollState  { IDLE, AWAITING };
-enum class CyclePhase { WAIT, LEFT_PENDING, RIGHT_PENDING, FRONT_PENDING };
+static UWBReading _uwbData = { .angleDeg = 0.0f, .distCm = -1.0f, .timestamp = 0 };
 
-struct UWBAnchor {
-    const char*     position;
-    char            moduleName[16] = {};
-    HardwareSerial& serial;
-    int             pinTx;
-    int             pinRx;
-    PollState    pollState    = PollState::IDLE;
-    uint32_t     sentAt       = 0;
-    char         buf[128]     = {};
-    int          bufPos       = 0;
-    KalmanFilter kalman       = {};
-    float        rawDist      = -1.0f;
-    float        prevDist     = -1.0f; // last accepted distance, -1 = no baseline yet
-    int          rejectStreak = 0;     // consecutive outlier rejections
-};
+// --- Outlier rejection ---
 
-static UWBReading _uwbData = {};
+static float _prevDistCm   = -1.0f; // last accepted distance, -1 = no baseline
+static int   _rejectStreak = 0;     // consecutive outlier rejections
 
-static UWBAnchor anchorLeft  { "left",  {}, Serial1,   PIN_UWB_LEFT_TX,  PIN_UWB_LEFT_RX  };
-static UWBAnchor anchorRight { "right", {}, Serial2,   PIN_UWB_RIGHT_TX, PIN_UWB_RIGHT_RX };
-static UWBAnchor anchorFront { "front", {}, uartFront, PIN_UWB_FRONT_TX, PIN_UWB_FRONT_RX };
+// --- Binary frame state machine (0x2A ... 0x23) ---
 
-// --- AT command helpers (blocking, init/cal use only) ------------------------
+static const uint8_t FRAME_HEADER = 0x2A;
+static const uint8_t FRAME_FOOTER = 0x23;
 
-// Sends a query command and copies the value that follows prefix into out.
-static bool uwb_at_query(UWBAnchor& anchor, const char* cmd, const char* prefix, char* out, size_t outLen) {
-    while (anchor.serial.available()) anchor.serial.read();
-    anchor.serial.print(cmd); anchor.serial.print("\r\n");
-    uint32_t sentAt = millis();
-    char buf[64]; int pos = 0; buf[0] = '\0';
-    while (millis() - sentAt < UWB_RESPONSE_TIMEOUT_MS) {
-        while (anchor.serial.available() && pos < 63) {
-            char c = anchor.serial.read();
-            if (c == '\n') {
-                buf[pos] = '\0';
-                const char* p = strstr(buf, prefix);
-                if (p) {
-                    strncpy(out, p + strlen(prefix), outLen - 1);
-                    out[outLen - 1] = '\0';
-                    return true;
-                }
-                pos = 0;
-            } else if (c != '\r') buf[pos++] = c;
-        }
+enum class BinState { WAIT_LENGTH, READ_PAYLOAD, WAIT_CHECKSUM, WAIT_FOOTER };
+
+static BinState _binState       = BinState::WAIT_LENGTH;
+static uint8_t  _binPayload[64] = {};
+static uint8_t  _binLength      = 0;
+static uint8_t  _binPayloadIdx  = 0;
+static uint8_t  _binChecksum    = 0;
+
+
+static void on_frame() {
+    uint8_t calc = 0;
+    for (int i = 0; i < _binLength; i++) calc ^= _binPayload[i];
+    if (calc != _binChecksum) {
+        ESP_LOGW(TAG, "checksum mismatch — frame discarded (calc=0x%02X recv=0x%02X)", calc, _binChecksum);
+        return;
     }
-    return false;
-}
-
-// Sends a command and returns true if any response line contains expected.
-static bool uwb_at_send(UWBAnchor& anchor, const char* cmd, const char* expected) {
-    char discard[2];
-    return uwb_at_query(anchor, cmd, expected, discard, sizeof(discard));
-}
-
-// --- Calibration -------------------------------------------------------------
-
-static int uwb_get_cal(UWBAnchor& anchor) {
-    char val[16] = {};
-    if (!uwb_at_query(anchor, "AT+CAL?", "+CAL=", val, sizeof(val))) return 0;
-    return atoi(val);
-}
-
-static bool uwb_set_cal(UWBAnchor& anchor, int cal) {
-    char cmd[24];
-    snprintf(cmd, sizeof(cmd), "AT+CAL=%d", cal);
-    return uwb_at_send(anchor, cmd, "+OK");
-}
-
-// --- Init / diagnostics ------------------------------------------------------
-
-// Parses a +ANCHOR_RCV= response line and returns the distance field in cm, or -1.
-static int parse_anchor_rcv(const char* buf) {
-    const char* p = strstr(buf, "+ANCHOR_RCV=");
-    if (!p) return -1;
-    p += strlen("+ANCHOR_RCV=");
-    for (int i = 0; i < 3 && p; i++) p = strchr(p, ',') + 1;
-    return p ? atoi(p) : -1;
-}
-
-// Blocking single poll — used only at init time for calibration/diagnostics.
-// Returns distance in cm, or -1 on timeout.
-static int uwb_poll_blocking(UWBAnchor& anchor) {
-    while (anchor.serial.available()) anchor.serial.read();
-    anchor.serial.print("AT+ANCHOR_SEND=TAG,4,TEST\r\n");
-
-    uint32_t sentAt = millis();
-    char buf[128]; int pos = 0; buf[0] = '\0';
-
-    while (millis() - sentAt < UWB_RESPONSE_TIMEOUT_MS) {
-        while (anchor.serial.available() && pos < 127) {
-            char c = anchor.serial.read();
-            if (c == '\n') {
-                buf[pos] = '\0';
-                if (strstr(buf, "+ANCHOR_RCV=")) {
-                    return parse_anchor_rcv(buf);
-                }
-                pos = 0;
-            } else if (c != '\r') {
-                buf[pos++] = c;
-            }
-        }
-    }
-    return -1;
-}
-
-static bool uwb_init_anchor(UWBAnchor& anchor) {
-    anchor.serial.begin(115200, SERIAL_8N1, anchor.pinRx, anchor.pinTx);
-
-    // Reset after serial is ready, then drain until 200ms of idle (matches original library sequence)
-    digitalWrite(PIN_UWB_NRST, LOW);  delay(5);
-    digitalWrite(PIN_UWB_NRST, HIGH);
-    uint32_t idleStart = millis();
-    while (millis() - idleStart < 200) {
-        if (anchor.serial.available()) { anchor.serial.read(); idleStart = millis(); }
-    }
-
-    uwb_at_query(anchor, "AT+ADDRESS?", "+ADDRESS=", anchor.moduleName, sizeof(anchor.moduleName));
-
-    bool ok = uwb_at_send(anchor, "AT", "+OK");
-    if (ok) {
-        ESP_LOGI(TAG, "✅ [%s/%s] ready", anchor.position, anchor.moduleName);
-    } else {
-        ESP_LOGE(TAG, "❌ [%s/%s] not responding", anchor.position, anchor.moduleName);
-    }
-    return ok;
-}
-
-static void uwb_test_anchor(UWBAnchor& anchor, uint32_t durationMs) {
-    int polls = 0, successes = 0;
-    int minDist = INT_MAX, maxDist = 0;
-    float mean = 0, M2 = 0; // Welford's online variance
-    uint32_t start = millis();
-
-    ESP_LOGI(TAG, "🔍 [%s/%s] running %us test...", anchor.position, anchor.moduleName, durationMs / 1000);
-
-    while (millis() - start < durationMs) {
-        int dist = uwb_poll_blocking(anchor);
-        polls++;
-        if (dist >= 0) {
-            successes++;
-            float delta = dist - mean;
-            mean += delta / successes;
-            M2  += delta * (dist - mean);
-            if (dist < minDist) minDist = dist;
-            if (dist > maxDist) maxDist = dist;
-        }
-        delay(UWB_CAL_POLL_INTERVAL_MS);
-    }
-
-    float stddev = successes > 1 ? sqrtf(M2 / (successes - 1)) : 0;
-    ESP_LOGI(TAG, "  [%s/%s] %d/%d ok (%.0f%%)  avg=%.0fcm  stddev=%.1fcm  min=%d  max=%d",
-        anchor.position, anchor.moduleName, successes, polls, 100.0f * successes / polls,
-        mean, stddev, successes > 0 ? minDist : -1, maxDist);
-}
-
-void uwb_run_diagnostics() {
-    ESP_LOGI(TAG, "=== UWB Diagnostics Start ===");
-    uwb_test_anchor(anchorLeft,  30000);
-    uwb_test_anchor(anchorRight, 30000);
-    ESP_LOGI(TAG, "=== UWB Diagnostics Complete ===");
-}
-
-static void uwb_calibrate_anchor(UWBAnchor& anchor, float knownDistCm, int numSamples) {
-    if (uwb_poll_blocking(anchor) < 0) {
-        ESP_LOGW(TAG, "⚠️ [%s/%s] calibration skipped — tag not found", anchor.position, anchor.moduleName);
+    if (_binLength < 11) {
+        ESP_LOGW(TAG, "frame too short (%u bytes) — discarded", _binLength);
         return;
     }
 
-    int existingCal = uwb_get_cal(anchor);
-    int samples[UWB_CALIBRATION_SAMPLES];
-    int count = 0;
+    int32_t rawAngle;
+    int32_t rawDistCm;
+    memcpy(&rawAngle,  &_binPayload[3], 4);
+    memcpy(&rawDistCm, &_binPayload[7], 4);
 
-    for (int i = 0; i < numSamples && count < UWB_CALIBRATION_SAMPLES; i++) {
-        int d = uwb_poll_blocking(anchor);
-        if (d >= 0) samples[count++] = d;
-        // Match normal poll interval so TWR conditions match steady-state operation.
-        delay(UWB_CAL_POLL_INTERVAL_MS);
-    }
+    float angleDeg = -(float)rawAngle * DW3000_ANGLE_SCALE;
+    float distCm   = (float)rawDistCm;
 
-    // Mean of all samples
-    float sum = 0;
-    for (int i = 0; i < count; i++) sum += samples[i];
-    float mean = sum / count;
-
-    // Standard deviation
-    float variance = 0;
-    for (int i = 0; i < count; i++) variance += (samples[i] - mean) * (samples[i] - mean);
-    float sigma = sqrtf(variance / count);
-
-    // Reject outliers (> 2σ from mean), recompute mean
-    float filteredSum = 0; int filteredCount = 0;
-    for (int i = 0; i < count; i++) {
-        if (fabsf(samples[i] - mean) <= 2.0f * sigma) {
-            filteredSum += samples[i];
-            filteredCount++;
+    // Outlier rejection on distance.
+    bool accept = true;
+    if (_prevDistCm >= 0.0f) {
+        float jump = fabsf(distCm - _prevDistCm);
+        if (jump > rtConfig.uwbOutlierRejectCm && _rejectStreak < UWB_OUTLIER_MAX_STREAK) {
+            ESP_LOGW(TAG, "outlier rejected: %.0fcm (prev=%.0f jump=%.0f streak=%d)",
+                distCm, _prevDistCm, jump, _rejectStreak + 1);
+            _rejectStreak++;
+            accept = false;
         }
     }
 
-    if (filteredCount == 0) {
-        ESP_LOGW(TAG, "⚠️ [%s/%s] calibration: all samples rejected as outliers, using raw mean", anchor.position, anchor.moduleName);
-        filteredSum = sum; filteredCount = count;
+    if (accept) {
+        _prevDistCm        = distCm;
+        _rejectStreak      = 0;
+        _uwbData.angleDeg  = angleDeg;
+        _uwbData.distCm    = distCm;
+        _uwbData.timestamp = millis();
+        ESP_LOGD(TAG, "angle=%.1f°  dist=%.0fcm", angleDeg, distCm);
+    }
+}
+
+static void process_byte(uint8_t b) {
+    static bool _inFrame = false;
+
+    if (!_inFrame) {
+        if (b == FRAME_HEADER) {
+            _inFrame   = true;
+            _binState  = BinState::WAIT_LENGTH;
+        }
+        return;
     }
 
-    float filteredMean = filteredSum / filteredCount;
-    int error = (int)roundf(filteredMean - knownDistCm);
+    switch (_binState) {
+        case BinState::WAIT_LENGTH:
+            _binLength     = b;
+            _binPayloadIdx = 0;
+            if (_binLength > 0 && _binLength <= (uint8_t)sizeof(_binPayload)) {
+                _binState = BinState::READ_PAYLOAD;
+            } else {
+                ESP_LOGW(TAG, "implausible frame length %u — resyncing", _binLength);
+                _inFrame = false;
+            }
+            break;
 
-    int newCal = existingCal - error;
-    ESP_LOGI(TAG, "✅ [%s/%s] calibration: %d/%d samples kept, mean=%.1f, known=%.1f, error=%d cm, cal %d→%d",
-             anchor.position, anchor.moduleName, filteredCount, count, filteredMean, knownDistCm, error, existingCal, newCal);
+        case BinState::READ_PAYLOAD:
+            _binPayload[_binPayloadIdx++] = b;
+            if (_binPayloadIdx >= _binLength) _binState = BinState::WAIT_CHECKSUM;
+            break;
 
-    uwb_set_cal(anchor, newCal);
+        case BinState::WAIT_CHECKSUM:
+            _binChecksum = b;
+            _binState    = BinState::WAIT_FOOTER;
+            break;
+
+        case BinState::WAIT_FOOTER:
+            if (b == FRAME_FOOTER) {
+                on_frame();
+            } else {
+                ESP_LOGW(TAG, "expected footer 0x23, got 0x%02X — frame discarded", b);
+            }
+            _inFrame = false;
+            break;
+    }
 }
+
+// --- Public API ---
 
 void uwb_init() {
-    pinMode(PIN_UWB_NRST, OUTPUT);
+    _dwSerial.begin(DW3000_BAUD, SERIAL_8N1, PIN_DW3000_RX, PIN_DW3000_TX);
 
-    uwb_init_anchor(anchorLeft);
-    uwb_init_anchor(anchorRight);
-    uwb_init_anchor(anchorFront);
-    if (UWB_CALIBRATE_ON_STARTUP) {
-        // Tag is assumed on the car centerline at UWB_CALIBRATION_DISTANCE_CM forward of the left/right anchor line.
-        // Front anchor's known distance is computed from its offset position to that tag location.
-        float frontCalDist = sqrtf(UWB_FRONT_X_CM * UWB_FRONT_X_CM +
-                                   (UWB_CALIBRATION_DISTANCE_CM - UWB_FRONT_Y_CM) *
-                                   (UWB_CALIBRATION_DISTANCE_CM - UWB_FRONT_Y_CM));
-        uwb_calibrate_anchor(anchorLeft,  UWB_CALIBRATION_DISTANCE_CM, UWB_CALIBRATION_SAMPLES);
-        uwb_calibrate_anchor(anchorRight, UWB_CALIBRATION_DISTANCE_CM, UWB_CALIBRATION_SAMPLES);
-        uwb_calibrate_anchor(anchorFront, frontCalDist,                 UWB_CALIBRATION_SAMPLES);
-    }
-}
-
-// Writes a ranging result into _uwbData for whichever anchor this is. Negative = invalid.
-static void uwb_write_dist(UWBAnchor& anchor, float dist) {
-    if      (&anchor == &anchorLeft)  _uwbData.distLeft  = dist;
-    else if (&anchor == &anchorRight) _uwbData.distRight = dist;
-    else                              _uwbData.distFront = dist;
-}
-
-// --- Non-blocking ranging loop -----------------------------------------------
-
-static void uwb_start_poll(UWBAnchor& anchor) {
-    while (anchor.serial.available()) anchor.serial.read();
-    anchor.serial.print("AT+ANCHOR_SEND=TAG,4,TEST\r\n");
-    anchor.sentAt    = millis();
-    anchor.bufPos    = 0;
-    anchor.buf[0]    = '\0';
-    anchor.pollState = PollState::AWAITING;
-}
-
-// Drains UART for one anchor and updates _uwbData when a response or timeout arrives.
-static void uwb_update_anchor(UWBAnchor& anchor) {
-    while (anchor.serial.available() && anchor.bufPos < 127) {
-        char c = anchor.serial.read();
-        if (c == '\n') {
-            anchor.buf[anchor.bufPos] = '\0';
-            if (strstr(anchor.buf, "+ANCHOR_RCV=")) {
-                int dist = parse_anchor_rcv(anchor.buf);
-                uint32_t latency = millis() - anchor.sentAt;
-                bool valid = dist >= 0;
-
-                // Outlier rejection: discard single-poll jumps larger than threshold.
-                // After UWB_OUTLIER_MAX_STREAK consecutive rejections, force-accept so a
-                // genuine large movement doesn't permanently block updates.
-                bool headingStale = millis() - _uwbData.timestamp > UWB_STALE_HEADING_MS;
-                if (valid && anchor.prevDist >= 0.0f && !headingStale) {
-                    float jump = fabsf((float)dist - anchor.prevDist);
-                    if (jump > rtConfig.uwbOutlierRejectCm && anchor.rejectStreak < UWB_OUTLIER_MAX_STREAK) {
-                        ESP_LOGW(TAG, "⚠️ [%s/%s] outlier rejected: %dcm (prev=%.0fcm jump=%.0fcm streak=%d)",
-                                 anchor.position, anchor.moduleName, dist, anchor.prevDist, jump, anchor.rejectStreak + 1);
-                        anchor.rejectStreak++;
-                        valid = false;
-                    }
-                }
-                if (valid) {
-                    anchor.prevDist     = (float)dist;
-                    anchor.rejectStreak = 0;
-                }
-
-                anchor.rawDist = valid ? (float)dist : anchor.rawDist;
-                float filtered = valid ? anchor.kalman.update((float)dist, rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR) : anchor.kalman.x;
-                ESP_LOGD(TAG, "✅ [%s/%s] raw=%d filtered=%.1f cm  latency=%ums", anchor.position, anchor.moduleName, dist, filtered, latency);
-                uwb_write_dist(anchor, valid ? filtered : -1.0f);
-                anchor.pollState = PollState::IDLE;
-                return;
-            }
-            anchor.bufPos = 0;
-        } else if (c != '\r') {
-            anchor.buf[anchor.bufPos++] = c;
-        }
+    // Wait up to 2s for the first ranging frame. The anchor streams immediately on power-up,
+    // so a timeout here means a wiring or power problem.
+    uint32_t deadline = millis() + 2000;
+    while (millis() < deadline) {
+        while (_dwSerial.available()) process_byte((uint8_t)_dwSerial.read());
+        if (_uwbData.timestamp > 0) break;
+        delay(10);
     }
 
-    if (millis() - anchor.sentAt >= UWB_RESPONSE_TIMEOUT_MS) {
-        // ESP_LOGW(TAG, "⚠️ [%s/%s] no response  latency=%ums", anchor.position, anchor.moduleName, millis() - anchor.sentAt);
-        uwb_write_dist(anchor, -1.0f);
-        anchor.pollState = PollState::IDLE;
+    if (_uwbData.timestamp > 0) {
+        ESP_LOGI(TAG, "✅ DW3000 ready  angle=%.1f°  dist=%.0fcm", _uwbData.angleDeg, _uwbData.distCm);
+    } else {
+        ESP_LOGE(TAG, "❌ DW3000 no frames in 2s — check wiring (RX=GPIO%d TX=GPIO%d)", PIN_DW3000_RX, PIN_DW3000_TX);
     }
 }
 
 void uwb_update() {
-    static uint32_t  lastCycleEnd  = 0;
-    static uint32_t  lastUartCheck = 0;
-    static CyclePhase phase        = CyclePhase::WAIT;
-
-    if (phase == CyclePhase::WAIT) {
-        if (millis() - lastCycleEnd < UWB_POLL_INTERVAL_MS) return;
-        uwb_start_poll(anchorLeft);
-        phase = CyclePhase::LEFT_PENDING;
-        return;
-    }
-
-    // Rate-limit UART polling to 1kHz
-    if (millis() - lastUartCheck < 1) return;
-    lastUartCheck = millis();
-
-    if (phase == CyclePhase::LEFT_PENDING) {
-        uwb_update_anchor(anchorLeft);
-        if (anchorLeft.pollState == PollState::IDLE) {
-            uwb_start_poll(anchorRight);
-            phase = CyclePhase::RIGHT_PENDING;
-        }
-        return;
-    }
-
-    if (phase == CyclePhase::RIGHT_PENDING) {
-        uwb_update_anchor(anchorRight);
-        if (anchorRight.pollState == PollState::IDLE) {
-            uwb_start_poll(anchorFront);
-            phase = CyclePhase::FRONT_PENDING;
-        }
-        return;
-    }
-
-    // phase == FRONT_PENDING
-    uwb_update_anchor(anchorFront);
-    if (anchorFront.pollState == PollState::IDLE) {
-        bool lv = anchorLeft.rawDist  >= 0;
-        bool rv = anchorRight.rawDist >= 0;
-        if (lv && rv)  _uwbData.distFast = (anchorLeft.rawDist + anchorRight.rawDist) / 2.0f;
-        else if (lv)   _uwbData.distFast = anchorLeft.rawDist;
-        else if (rv)   _uwbData.distFast = anchorRight.rawDist;
-        _uwbData.timestamp = millis();
-        lastCycleEnd    = millis();
-        phase = CyclePhase::WAIT;
+    while (_dwSerial.available()) {
+        process_byte((uint8_t)_dwSerial.read());
     }
 }
 

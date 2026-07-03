@@ -9,7 +9,8 @@ struct RuntimeConfig {
     float throttleDeadband;
     float followDistanceCm;
     float maxDistanceCm;
-    float targetSpeedMph;
+    float minSpeedMph;
+    float maxSpeedMph;
     float kp;
     float ki;
     float kd;

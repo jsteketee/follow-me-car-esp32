@@ -1,5 +1,5 @@
 // Sensor fusion layer.
-// Tracks the tag's absolute compass bearing, blending UWB trilateration and camera blob
+// Tracks the tag's absolute compass bearing, blending UWB AOA angle and camera blob
 // angle via a 1-D Kalman filter on bearing. Converting back to relative angle using imu.yaw
 // gives automatic rotation compensation without gyro integration or drift.
 #include "fusion.h"
@@ -15,8 +15,9 @@
 
 static const char* TAG = "fusion";
 
-static Pose     _fusedPose          = { .fusedAngle = 0.0f, .uwbAngle = NAN, .camAngle = NAN, .distanceCm = -1.0f };
-static float         _bearingDeg          = NAN;     // absolute compass bearing of tag (0–360°)
+static Pose     _fusedPose          = { .fusedAngle = 0.0f, .uwbAngle = NAN, .camAngle = NAN, .distanceCm = -1.0f, .uwbDistCm = -1.0f };
+static KalmanFilter  _distKalman;                    // 1-D Kalman filter tracking distance to tag (cm)
+static float         _bearingDeg          = 0.0f;    // Kalman state estimate of absolute bearing to tag
 static float         _bearingP            = 1000.0f; // bearing estimate variance (deg²)
 static float         _innovEwma           = 0.0f;    // EWMA of innov² (deg²) — spikes on surprise, decays on consistent readings
 static uint32_t      _lastUpdateMs        = 0;
@@ -27,69 +28,7 @@ static float         _fusedOdometryCm     = 0.0f;
 static float         _layMean             = 0.0f;
 static float         _layVariance         = 0.0f;
 
-// Returns angle to tag in degrees relative to car's forward axis.
-// 0° = straight ahead, positive = right, negative = left. NAN if data invalid.
-static float calc_tag_heading(const UWBReading& uwb) {
-    if (uwb.distLeft < 0 || uwb.distRight < 0) {
-        // ESP_LOGW(TAG, "⚠️ invalid UWB reading (dL=%.0f dR=%.0f)", uwb.distLeft, uwb.distRight);
-        return NAN;
-    }
-
-    float dL = uwb.distLeft;
-    float dR = uwb.distRight;
-    float d  = UWB_ANCHOR_SEPARATION_CM;
-
-    float x        = (dL * dL - dR * dR) / (2.0f * d);
-    float ySquared = dL * dL - (x + d / 2.0f) * (x + d / 2.0f);
-
-    if (ySquared < 0) {
-        ESP_LOGW(TAG, "⚠️ geometry failure (dL:%.0f dR:%.0f x:%.0f ySquared:%.1f)", dL, dR, x, ySquared);
-        return NAN;
-    }
-
-    float y = sqrtf(ySquared);
-
-    // Front/back disambiguation latch. Updated when distFront is valid; held on dropout.
-    // Abrupt flips (heading change > UWB_FRONT_FLIP_ABRUPT_DEG) require UWB_FRONT_FLIP_CONFIRM
-    // consecutive readings before the latch flips. Any agreeing reading resets the streak.
-    static bool _tagIsBehind = false;
-    static int  _flipStreak  = 0;
-    if (uwb.distFront > 0) {
-        float dx            = x - UWB_FRONT_X_CM;
-        float distIfForward = sqrtf(dx*dx + (y - UWB_FRONT_Y_CM)*(y - UWB_FRONT_Y_CM));
-        float distIfBehind  = sqrtf(dx*dx + (y + UWB_FRONT_Y_CM)*(y + UWB_FRONT_Y_CM));
-        bool behind = fabsf(uwb.distFront - distIfBehind) < fabsf(uwb.distFront - distIfForward);
-        if (behind != _tagIsBehind) {
-            float h1 = atan2f(x,  y) * 180.0f / M_PI;
-            float h2 = atan2f(x, -y) * 180.0f / M_PI;
-            float delta = fabsf(h1 - h2);
-            if (delta > 180.0f) delta = 360.0f - delta;
-            bool abrupt = delta > UWB_FRONT_FLIP_ABRUPT_DEG;
-            if (!abrupt || ++_flipStreak >= UWB_FRONT_FLIP_CONFIRM) {
-                ESP_LOGI(TAG, "↕ tag side: %s → %s  (distFront=%.0f fwd_exp=%.0f beh_exp=%.0f  delta=%.0f° streak=%d)",
-                         _tagIsBehind ? "behind" : "front", behind ? "behind" : "front",
-                         uwb.distFront, distIfForward, distIfBehind, delta, _flipStreak);
-                _tagIsBehind = behind;
-                _flipStreak  = 0;
-            } else {
-                ESP_LOGD(TAG, "⟳ side flip deferred: delta=%.0f° streak=%d/%d  (distFront=%.0f)",
-                         delta, _flipStreak, UWB_FRONT_FLIP_CONFIRM, uwb.distFront);
-            }
-        } else {
-            _flipStreak = 0;
-        }
-    }
-    if (_tagIsBehind) y = -y;
-
-    float heading = atan2f(x, y) * 180.0f / M_PI;
-    // ESP_LOGI(TAG, "✅ heading=%.1f°  dL=%.0f dR=%.0f  side=%s", heading, dL, dR, _tagIsBehind ? "behind" : "front");
-    return heading;
-}
-
-// Update the absolute bearing estimate from a new relative angle measurement.
-// r = measurement noise variance (deg²). Lower r = more trust in this measurement.
-// imu.yaw increases counterclockwise; our relAngle convention is positive = right (clockwise),
-// so absolute bearing = imuYaw - relAngle.
+// Update the absolute bearing estimate from a new relative angle measurement
 static void correct_bearing(float relAngle, float imuYaw, float r) {
     float measured = imuYaw - relAngle;
     while (measured >= 360.0f) measured -= 360.0f;
@@ -137,7 +76,9 @@ static bool detect_cogging(float lay) {
 }
 
 void fusion_init() {
-    ESP_LOGI(TAG, "✅ fusion ready");
+    ESP_LOGI(TAG, "✅ fusion ready  rUwb=%.1f  rCam=%.1f  stale=%.1f  innovMeanAlpha=%.3f  innovEwmaAlpha=%.3f",
+        rtConfig.fusionRUwb, rtConfig.fusionRCamera, rtConfig.fusionStaleUncertainty,
+        rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha);
 }
 
 void fusion_update() {
@@ -147,47 +88,43 @@ void fusion_update() {
 
     uint32_t now = millis();
 
-    // Seed bearing from IMU yaw once it has a valid reading, so steering is active before the first sensor fix.
-    if (isnan(_bearingDeg) && imu.update_hz > 0) {
-        _bearingDeg = imu.yaw;
-        ESP_LOGI(TAG, "bearing seeded from IMU: %.1f°", _bearingDeg);
-    }
-
-    // Grow bearing uncertainty every loop — covers both between-fix gaps and sensor dropout.
+    // Grow bearing uncertainty every loop as data becomes stale.
     if (_lastUpdateMs > 0) {
         float dt = (now - _lastUpdateMs) / 1000.0f;
         _bearingP += (rtConfig.fusionStaleUncertainty / rtConfig.sensorTimeoutSec) * dt;
     }
     _lastUpdateMs = now;
 
-    // Cogging detection runs first so the result is available for dead reckoning below.
+    // Perform Odom Dead reckoning gated by cogging detection. This updates distance in between UWB Readings. 
     bool cogging = detect_cogging(imu.lay);
-
-    // Dead reckoning: subtract distance traveled since last loop from distanceCm.
-    // UWB overwrites with a fresh value when a reading arrives, so this only matters during dropout.
-    // Skip odometry increment during cogging — false RPM pulses would otherwise shrink distanceCm.
     float rpmOdom = rpm_get().odometryCm;
     float traveled = rpmOdom - _lastOdometryCm;
     _lastOdometryCm = rpmOdom;
     if (!cogging) {
         _fusedOdometryCm += traveled;
-        if (_fusedPose.distanceCm >= 0.0f)
-            _fusedPose.distanceCm = fmaxf(0.0f, _fusedPose.distanceCm - traveled);
+        if (_distKalman.initialized)
+            _distKalman.x = fmaxf(0.0f, _distKalman.x - traveled);
     }
+    _fusedPose.distanceCm = _distKalman.initialized ? _distKalman.x : -1.0f;
 
+
+    
+    // Nudge bearing from UWB reading. The Kalman filter is applied in correct_bearing().
     bool uwbUpdated = false;
     if (uwb.timestamp != _lastUwbTimestamp) {
         _lastUwbTimestamp = uwb.timestamp;
-        float heading = calc_tag_heading(uwb);
-        if (!isnan(heading)) {
-            _fusedPose.uwbAngle = heading;
-            correct_bearing(heading, imu.yaw, rtConfig.fusionRUwb);
-            _fusedPose.distanceCm = uwb.distFast;
+        if (uwb.distCm >= 0.0f) {
+            _fusedPose.uwbAngle  = uwb.angleDeg;
+            _fusedPose.uwbDistCm = uwb.distCm;
+            correct_bearing(uwb.angleDeg, imu.yaw, rtConfig.fusionRUwb);
+            _distKalman.update(uwb.distCm, rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR);
+            _fusedPose.distanceCm = _distKalman.x;
             _fusedPose.timestamp  = now;
             uwbUpdated = true;
         }
     }
 
+    // Update bearing from camera readings. The Kalman filter is applied in correct_bearing().
     bool camUpdated = false;
     if (cam.timestamp != _lastCameraTimestamp) {
         _lastCameraTimestamp = cam.timestamp;
@@ -201,7 +138,6 @@ void fusion_update() {
     }
 
     // Convert absolute bearing back to relative angle using current compass heading.
-    // Negated because imu.yaw increases counterclockwise, but our angle convention is positive = right.
     if (!isnan(_bearingDeg)) {
         float relAngle = imu.yaw - _bearingDeg;
         while (relAngle >  180.0f) relAngle -= 360.0f;
@@ -209,15 +145,19 @@ void fusion_update() {
         _fusedPose.fusedAngle = relAngle;
     }
 
+    // Update uncertainty and speed
     _fusedPose.uncertainty     = _bearingP + _innovEwma;
     _fusedPose.fusedSpeedMph   = cogging ? 0.0f : rpm_get().speedMph;
     _fusedPose.fusedOdometryCm = _fusedOdometryCm;
 
+    // Log updates to serial for debugging
     if (uwbUpdated || camUpdated) {
-        ESP_LOGI(TAG, "bearing=%.1f°  angle=%.1f°  dist=%.0fcm  unc=%.1f  src=%s",
-            _bearingDeg, _fusedPose.fusedAngle, _fusedPose.distanceCm,
-            _fusedPose.uncertainty,
-            camUpdated ? "📷 blob" : "📡 uwb");
+        const char* src = (uwbUpdated && camUpdated) ? "📡 uwb + 📷 blob"
+                        : uwbUpdated                 ? "📡 uwb"
+                                                     : "📷 blob";
+        ESP_LOGI(TAG, "bearing=%.1f°  angle=%.1f°  uwbRaw=%.1f°  dist=%.0fcm  rawDist=%.0fcm  unc=%.1f  src=%s",
+            _bearingDeg, _fusedPose.fusedAngle, _fusedPose.uwbAngle,
+            _fusedPose.distanceCm, _fusedPose.uwbDistCm, _fusedPose.uncertainty, src);
     }
 }
 
