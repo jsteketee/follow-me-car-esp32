@@ -10,7 +10,6 @@ RuntimeConfig rtConfig = {
     .kp                     = THROTTLE_PID_KP,
     .ki                     = THROTTLE_PID_KI,
     .kd                     = THROTTLE_PID_KD,
-    .throttleFfK            = THROTTLE_FF_K,
     .smoothAlpha            = THROTTLE_SMOOTH_ALPHA,
     .steeringTrim           = 0.0f,
     .steeringKp             = STEERING_PID_KP,

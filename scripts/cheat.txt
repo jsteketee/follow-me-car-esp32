@@ -1,25 +1,33 @@
-pio run -e test --target upload
-sleep 2
-pio device monitor 
-==
+## Build & Flash
+pio run -e car --target upload                              # main build, upload over USB
+pio run -e car --target upload --upload-port 192.168.4.1   # upload over WiFi (car must be on)
+pio run -e test --target upload                             # info-level logging
+pio run -e debug --target upload                            # debug-level logging
+pio run -e no-camera --target upload                        # disable camera module
+pio run -e dw3000-test --target upload                      # standalone DW3000 UART test
+pio run -e dw3000-bridge --target upload                    # DW3000 serial bridge
+pio run -e as5600-test --target upload                      # standalone AS5600 encoder bench test
 
-View the imu plotter:
-python3 scripts/imu_plotter.py 
+## Monitor
+pio device monitor                                          # USB serial monitor
+sleep 2 && pio device monitor                               # wait for reboot then monitor
 
-===
-Connect to car wifi for terminal interface
-stty raw -echo && nc 192.168.4.1 23; stty -raw echo
+## WiFi / Network
+stty raw -echo && nc 192.168.4.1 23; stty -raw echo         # telnet terminal over car WiFi
+# Dashboard: WiFi "Follow Me" (no password) → http://192.168.4.1/
 
-Connect to dashboard
-WiFi: "Follow Me" (no password) → http://192.168.4.1/
+## Python Tools
+python3 scripts/rpm_plot.py                                 # live RPM sensor fusion plot — encoder, hall-effect, combined (USB serial)
+python3 scripts/imu_plotter.py                              # live IMU linear accel plot (USB serial)
+python3 scripts/as5600_plot.py                              # live AS5600 angle plot (requires as5600-test env)
+python3 scripts/uwb_poll.py [freq_hz]                       # poll UWB anchor and print rolling avg distance
+python3 scripts/uwb_terminal.py                             # interactive AT command terminal for UWB module
 
-pio run -e test --target upload --upload-port 192.168.4.1
-
-
-==
-Level	Macro	When to use
-Error	ESP_LOGE	Something failed and can't continue
-Warn	ESP_LOGW	Unexpected but recoverable
-Info	ESP_LOGI	Normal milestones
-Debug	ESP_LOGD	Detailed state during development
-Verbose	ESP_LOGV	High frequency, per-loop tracing
+## Log Levels (CORE_DEBUG_LEVEL in platformio.ini)
+# 2 = Warn (car env)   3 = Info (test env)   4 = Debug (debug env)   5 = Verbose
+# Level    Macro       When to use
+# Error    ESP_LOGE    Something failed and can't continue
+# Warn     ESP_LOGW    Unexpected but recoverable
+# Info     ESP_LOGI    Normal milestones
+# Debug    ESP_LOGD    Detailed state during development
+# Verbose  ESP_LOGV    High frequency, per-loop tracing

@@ -72,10 +72,11 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   <div class="card">
     <h2>Motion</h2>
     <div class="stat"><span>Speed</span><span id="speed" class="val">--</span></div>
-
     <div class="stat"><span>RPM</span><span id="rpm" class="val">--</span></div>
     <div class="stat"><span>Throttle</span><span id="throttle" class="val">--</span></div>
     <div class="stat"><span>Steering</span><span id="steering" class="val">--</span></div>
+    <div class="stat"><span>Cogging</span><span id="cogging" class="val">--</span></div>
+    <div class="stat"><span>Sign Changes</span><span id="signChanges" class="val">--</span></div>
   </div>
   <div class="card">
     <h2>IMU</h2>
@@ -146,11 +147,11 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
     </div>
     <div class="srow">
       <label><span>KP — speed PID proportional gain</span><span id="v_kp">--</span></label>
-      <input type="range" id="kp" min="1.0" max="8.0" step="0.1">
+      <input type="range" id="kp" min="0.0" max="8.0" step="0.1">
     </div>
     <div class="srow">
       <label><span>KI — speed PID integral gain</span><span id="v_ki">--</span></label>
-      <input type="range" id="ki" min="0.12" max="1.0" step="0.025">
+      <input type="range" id="ki" min="0.0" max="1.0" step="0.025">
     </div>
   </div>
   <div class="card">
@@ -268,6 +269,8 @@ function render(d) {
   set('rpm',      d.rpm.toFixed(0));
   set('throttle', (d.throttle * 100).toFixed(0) + '%');
   set('steering', d.steering.toFixed(2));
+  set('cogging',     d.cogging ? 'YES' : 'no');
+  set('signChanges', d.signChanges);
   set('heading',  d.heading.toFixed(1) + '°');
   set('cal_rot',  d.cal_rot + '/3');
   set('cal_acc',  d.cal_acc + '/3');
@@ -300,7 +303,7 @@ function render(d) {
   speedBuf.shift();
   targetBuf.push(d.tSp || 0);
   targetBuf.shift();
-  throttleBuf.push(d.cfg.ts > 0 ? d.throttle / d.cfg.ts : d.throttle);
+  throttleBuf.push(d.throttle);
   throttleBuf.shift();
   drawSpeedGraph();
   let thirdDeg, thirdLabel;
@@ -650,7 +653,6 @@ void dashboard_init() {
             float  val = req->getParam("value")->value().toFloat();
             if      (key == "throttleScale")          rtConfig.throttleScale          = val;
             else if (key == "smoothAlpha")            rtConfig.smoothAlpha            = val;
-            else if (key == "throttleFfK")            rtConfig.throttleFfK            = val;
             else if (key == "followDistanceCm")       rtConfig.followDistanceCm       = val;
             else if (key == "maxDistanceCm")          rtConfig.maxDistanceCm          = val;
             else if (key == "minSpeedMph")            rtConfig.minSpeedMph            = val;
@@ -728,10 +730,10 @@ void dashboard_update(float lps) {
     snprintf(buf, sizeof(buf),
         "{\"dist\":%.1f,\"angle\":%.1f,\"uwbAngle\":%.1f,\"uwbDist\":%.1f,\"headingHold\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
         "\"uwbQ\":%d,\"camQ\":%d,\"fixQ\":%d,"
-        "\"speed\":%.3f,\"rpm\":%.0f,"
+        "\"speed\":%.3f,\"rpm\":%.0f,\"cogging\":%d,\"signChanges\":%d,"
         "\"heading\":%.1f,\"cal_rot\":%u,\"cal_acc\":%u,"
         "\"throttle\":%.3f,\"steering\":%.3f,\"tSp\":%.3f,\"lps\":%.0f,"
-        "\"cfg\":{\"ts\":%.3f,\"sa\":%.3f,\"tff\":%.3f,\"fd\":%.0f,\"md\":%.0f,\"mnSp\":%.2f,\"mxSp\":%.2f,"
+        "\"cfg\":{\"ts\":%.3f,\"sa\":%.3f,\"fd\":%.0f,\"md\":%.0f,\"mnSp\":%.2f,\"mxSp\":%.2f,"
         "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,"
         "\"sTr\":%.3f,\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
         "\"uQ\":%.2f,\"uR\":%.2f,\"uOr\":%.1f,"
@@ -746,10 +748,10 @@ void dashboard_update(float lps) {
         nav.mode == NavMode::STOPPED      ? "STOPPED"      : "UNKNOWN",
         safeF(rpm.odometryCm),
         uwbQ, camQ, fixQ,
-        safeF(rpm.speedMph), safeF(rpm.rpm),
+        safeF(rpm.speedMph), safeF(rpm.rpm), (int)rpm.cogging, rpm.signChanges,
         safeF(imu.yaw), imu.cal_rot, imu.cal_accel,
         safeF(ctrl.throttle), safeF(ctrl.steering), safeF(ctrl.targetSpeedMph), safeF(lps),
-        rtConfig.throttleScale, rtConfig.smoothAlpha, rtConfig.throttleFfK,
+        rtConfig.throttleScale, rtConfig.smoothAlpha,
         rtConfig.followDistanceCm, rtConfig.maxDistanceCm,
         rtConfig.minSpeedMph, rtConfig.maxSpeedMph,
         rtConfig.kp, rtConfig.ki, rtConfig.kd,

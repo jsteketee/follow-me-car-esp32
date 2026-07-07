@@ -8,6 +8,6 @@ struct CameraData {
     unsigned long timestamp;
 };
 
-bool camera_init();   // returns true if camera found, false if not present
-void camera_update();
+bool camera_init();     // always returns true; camera_update() retries until device appears
+bool camera_update();   // true when a complete sensor read completed (blob or not); false if rate-gated or still retrying
 const CameraData& camera_get();

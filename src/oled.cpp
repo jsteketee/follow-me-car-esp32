@@ -4,6 +4,7 @@
 #include "fusion.h"
 #include "control.h"
 #include "imu.h"
+#include "rpm.h"
 #include "config.h"
 #include "runtime_config.h"
 #include "utils.h"
@@ -111,7 +112,7 @@ static void screen_1(float lps, const NavData& nav, const Pose& fused, const Con
     _oledDisplay.print(output.steering*100, 0);
 }
 
-static void screen_2(float lps, const NavData& nav, const Pose& fused, const ControlOutput& output) {
+static void screen_2(float lps, const NavData& nav, const Pose& fused, const ControlOutput& output, const RPMData& rpm) {
     if (nav.mode == NavMode::FOLLOW_ME && nav.sensorsValid)
         _oledDisplay.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SSD1306_WHITE);
 
@@ -133,6 +134,15 @@ static void screen_2(float lps, const NavData& nav, const Pose& fused, const Con
     if (uncBarH > 0)
         _oledDisplay.fillRect(uncBarX, barFloor - uncBarH + 1, barW, uncBarH, SSD1306_WHITE);
 
+    // Target speed bar: outline only, full height = maxSpeedMph
+    const int tgtBarX = uncBarX + barW + barSpacing;
+    float tgtNorm = rtConfig.maxSpeedMph > 0.0f
+        ? constrain(output.targetSpeedMph / rtConfig.maxSpeedMph, 0.0f, 1.0f)
+        : 0.0f;
+    int tgtBarH = (int)(tgtNorm * (barFloor + 1));
+    if (tgtBarH > 0)
+        _oledDisplay.drawRect(tgtBarX, barFloor - tgtBarH + 1, barW, tgtBarH, SSD1306_WHITE);
+
     drawHeadingArrow(fused.fusedAngle, fused.distanceCm, fused.timestamp);
 
     _oledDisplay.setTextSize(2);
@@ -153,18 +163,31 @@ static void screen_2(float lps, const NavData& nav, const Pose& fused, const Con
         nav.mode == NavMode::TEST      ? "TEST"   :
                                          "STOP";
     _oledDisplay.print(modeStr);
+
+    // Odometry in centimeters — displayed for distance calibration
+    char odoBuf[10];
+    snprintf(odoBuf, sizeof(odoBuf), "%.0f", rpm.odometryCm);
+    _oledDisplay.setCursor(72, barFloor + 2);
+    _oledDisplay.print(odoBuf);
+
+    // Cogging indicator — bottom right
+    if (rpm.cogging) {
+        _oledDisplay.setCursor(104, barFloor + 2);
+        _oledDisplay.print("COG");
+    }
 }
 
 void oled_update(float lps) {
     const NavData&       nav    = nav_get();
-    const Pose&     fused  = fusion_get();
+    const Pose&          fused  = fusion_get();
     const ControlOutput& output = control_get();
+    const RPMData&       rpm    = rpm_get();
     float dt;
     if (!_gate.tick(dt)) return;
     _oledHz.update();
 
     _frameCount++;
     _oledDisplay.clearDisplay();
-    screen_2(lps, nav, fused, output);
+    screen_2(lps, nav, fused, output, rpm);
     _oledDisplay.display();
 }

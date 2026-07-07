@@ -48,8 +48,32 @@ void imu_init()
     }
     enableReports();
     sh2_setDcdAutoSave(true);
+
+    // Poll until the first rotation vector event arrives (or 3s timeout).
+    // This consumes the power-on reset event so imu_update() never sees a false-positive
+    // reset warning, and gives fusion_init() a valid initial yaw to seed the bearing.
+    uint32_t deadline = millis() + 3000;
+    while (millis() < deadline) {
+        if (bno.getSensorEvent(&_sensorEvent) &&
+            _sensorEvent.sensorId == SH2_ROTATION_VECTOR) {
+            quaternionToEuler(
+                _sensorEvent.un.rotationVector.real,
+                _sensorEvent.un.rotationVector.i,
+                _sensorEvent.un.rotationVector.j,
+                _sensorEvent.un.rotationVector.k);
+            _imuData.cal_rot = _sensorEvent.status & 0x03;
+            // Consume the power-on reset flag so imu_update() doesn't log a spurious reset warning.
+            bno.wasReset();
+            imu_ready = true;
+            ESP_LOGI(TAG, "✅ BNO085 ready  yaw=%.1f°  cal=%d/3", _imuData.yaw, _imuData.cal_rot);
+            return;
+        }
+        delay(1);
+    }
+    // Consume the power-on reset flag so imu_update() doesn't log a spurious reset warning.
+    bno.wasReset();
     imu_ready = true;
-    ESP_LOGI(TAG, "✅ BNO085 ready");
+    ESP_LOGW(TAG, "⚠️ BNO085 init timeout — no rotation vector in 3s, yaw will be invalid");
 }
 
 // Need to figure this out.
@@ -115,7 +139,7 @@ void imu_update()
             uint32_t nowMs = millis();
             if (nowMs - lastReportMs >= 1000) {
                 lastReportMs = nowMs;
-                ESP_LOGI(TAG, "rotation interval: avg=%uus  min=%uus  max=%uus  jitter=%uus",
+                ESP_LOGD(TAG, "rotation interval: avg=%uus  min=%uus  max=%uus  jitter=%uus",
                     (uint32_t)_imuData.latency_us,
                     minIntervalUs == UINT32_MAX ? 0 : minIntervalUs,
                     maxIntervalUs,

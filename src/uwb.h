@@ -9,5 +9,5 @@ struct UWBReading {
 };
 
 void              uwb_init();
-void              uwb_update();
+bool              uwb_update();  // true when a new accepted frame was received this call
 const UWBReading& uwb_get();

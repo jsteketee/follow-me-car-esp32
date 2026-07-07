@@ -14,7 +14,6 @@ struct RuntimeConfig {
     float kp;
     float ki;
     float kd;
-    float throttleFfK;
     float smoothAlpha;
     // Steering
     float steeringTrim;

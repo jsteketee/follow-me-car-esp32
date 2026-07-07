@@ -1,9 +1,9 @@
-// ESC and steering servo control.
-// Consume navigation mode
-// Calculate error from targets
-// Run PIDs
-// Control Vehicle
+// Throttle and steering control layer.
+// Computes normalized [-1, 1] throttle and steering outputs from navigation mode,
+// sensor fusion data, and PID controllers. Has no knowledge of PWM, deadband,
+// smoothing, or servo hardware — all of that lives in actuators.cpp.
 #include "control.h"
+#include "actuators.h"
 #include "nav.h"
 #include "fusion.h"
 #include "config.h"
@@ -11,55 +11,29 @@
 #include "utils.h"
 #include "rpm.h"
 #include <Arduino.h>
-#include <ESP32Servo.h>
 #include "esp_log.h"
 
 static const char *TAG = "control";
 
-#define PWM_NEUTRAL_US 1500
-#define PWM_MIN_US     1000
-#define PWM_MAX_US     2000
-
-
-
-static Servo          escServo;
-static Servo          steerServo;
 static ControlOutput  _controlOutput = {0.0f, 0.0f};
 static PidController  _throttlePid  = { THROTTLE_PID_KP,  THROTTLE_PID_KI,  THROTTLE_PID_KD  };
 static PidController  _steeringPid  = { STEERING_PID_KP,  STEERING_PID_KI,  STEERING_PID_KD  };
 static NavMode        _prevNavMode    = NavMode::STOPPED;
 static RateGate       _gate{ CONTROL_UPDATE_INTERVAL_MS };
 
-
+// Returns the latest normalized throttle and steering output.
 const ControlOutput& control_get() { return _controlOutput; }
 
+// Initializes the actuator layer and LED indicator pin.
 void control_init() {
-    esp_log_level_set("ESP32Servo.cpp", ESP_LOG_ERROR);
-    esp_log_level_set("ESP32PWM.cpp",   ESP_LOG_ERROR);
-
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, LOW);
-
-    escServo.attach(PIN_ESC,   PWM_MIN_US, PWM_MAX_US);
-    steerServo.attach(PIN_SERVO, PWM_MIN_US, PWM_MAX_US);
-    escServo.writeMicroseconds(PWM_NEUTRAL_US);
-    steerServo.writeMicroseconds(PWM_NEUTRAL_US);
-
-    ESP_LOGI(TAG, "[control] ✅ ESC (pin %d) + Servo (pin %d) ready — neutral %d µs",
-             PIN_ESC, PIN_SERVO, PWM_NEUTRAL_US);
+    actuators_init();
+    ESP_LOGI(TAG, "✅ control ready");
 }
 
-static int float_to_pwm(float val) {
-    return (int)(PWM_NEUTRAL_US + constrain(val, -1.0f, 1.0f) * 500.0f);
-}
-
-static void control_apply() {
-    float steering = constrain(_controlOutput.steering + rtConfig.steeringTrim, -rtConfig.steeringMax, rtConfig.steeringMax);
-    escServo.writeMicroseconds(constrain(float_to_pwm(_controlOutput.throttle), PWM_MIN_US, PWM_MAX_US));
-    steerServo.writeMicroseconds(constrain(float_to_pwm(steering), PWM_MIN_US, PWM_MAX_US));
-}
-
-void control_update() {
+// Runs PID controllers and mode logic, then sends normalized outputs to actuators.
+bool control_update() {
     const NavData&   nav   = nav_get();
     const Pose& pose = fusion_get();
     float dt;
@@ -84,6 +58,7 @@ void control_update() {
     float targetSpeed      = NAN;   // NAN → bypass throttle PID
     float steeringSetpoint = NAN;   // NAN → bypass steering PID
     float steeringMeasure  = 0.0f;
+    bool  directMode       = false; // true → skip PID, _controlOutput already set
 
     // Reset steering PID on every mode transition.
     if (nav.mode != _prevNavMode) {
@@ -109,41 +84,40 @@ void control_update() {
             targetSpeed = rtConfig.maxSpeedMph;
             break;
         case NavMode::THROTTLE_TEST:
-            // Direct throttle control — bypass PID and smoothing
+            // Direct throttle command — bypasses PID; actuators still apply deadband/scale/smoothing.
             _controlOutput.throttle = rtConfig.testThrottle;
             _controlOutput.steering = 0.0f;
-            control_apply();
-            return;
+            directMode = true;
+            break;
         case NavMode::STOPPED:
             break;
     }
 
-    // Step 3 & 4: run PIDs or zero outputs
-    if (!isnan(steeringSetpoint)) {
-        if (pidTick)
-            _controlOutput.steering = _steeringPid.update(steeringSetpoint, steeringMeasure, dt);
-        // else hold last steering until next pidTick
-    } else {
-        _steeringPid.reset();
-        _controlOutput.steering = 0.0f;
-    }
-    _controlOutput.targetSpeedMph = isnan(targetSpeed) ? 0.0f : targetSpeed;
-    if (!isnan(targetSpeed)) {
-        if (pidTick) {
-            float pidOut = _throttlePid.update(targetSpeed, pose.fusedSpeedMph, dt);
-            float ffOut  = targetSpeed * rtConfig.throttleFfK;
-            _controlOutput.throttle = rtConfig.throttleDeadband + constrain(pidOut + ffOut, 0.0f, 1.0f) * (rtConfig.throttleScale - rtConfig.throttleDeadband);
+    // Step 3 & 4: run PIDs or zero outputs (skipped in direct-output modes)
+    if (!directMode) {
+        if (!isnan(steeringSetpoint)) {
+            if (pidTick)
+                _controlOutput.steering = _steeringPid.update(steeringSetpoint, steeringMeasure, dt);
+            // else hold last steering until next pidTick
+        } else {
+            _steeringPid.reset();
+            _controlOutput.steering = 0.0f;
         }
-        // else hold last throttle until next pidTick
-    } else {
-        _throttlePid.reset();
-        _controlOutput.throttle = 0.0f;
+        _controlOutput.targetSpeedMph = isnan(targetSpeed) ? 0.0f : targetSpeed;
+        if (!isnan(targetSpeed)) {
+            if (pidTick) {
+                // Normalize to [0,1] so PID gains are independent of the speed scale.
+                float norm   = rtConfig.maxSpeedMph > 0.0f ? rtConfig.maxSpeedMph : 1.0f;
+                float pidOut = _throttlePid.update(targetSpeed / norm, pose.fusedSpeedMph / norm, dt);
+                _controlOutput.throttle = constrain(pidOut, 0.0f, 1.0f);
+            }
+            // else hold last throttle until next pidTick
+        } else {
+            _throttlePid.reset();
+            _controlOutput.throttle = 0.0f;
+        }
     }
 
-    static float _smoothThrottle = 0.0f;
-    _smoothThrottle += rtConfig.smoothAlpha * (_controlOutput.throttle - _smoothThrottle);
-    _controlOutput.throttle = _smoothThrottle;
-
-    control_apply();
+    actuators_set(_controlOutput.throttle, _controlOutput.steering);
+    return pidTick;
 }
-

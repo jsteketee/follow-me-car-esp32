@@ -63,14 +63,6 @@
 #define IMU_REPORT_INTERVAL_MS   10   // How often IMU reports data
 // #define IMU_ACCEL_PLOTTER           // Uncomment to stream lax/lay/laz to serial plotter
 
-// =============================================================================
-// Cogging Detection
-// =============================================================================
-#define COGGING_LAY_MEAN_ALPHA    0.05f  // smoothing for lay mean (~200ms window — tracks net direction)
-#define COGGING_LAY_VAR_ALPHA     0.10f  // smoothing for lay variance (~100ms window — tracks oscillation energy)
-#define COGGING_MEAN_THRESHOLD    0.5f   // max |mean| (m/s²) to qualify as near-zero net acceleration
-#define COGGING_VAR_THRESHOLD     4.0f   // min variance (m/s²)² to qualify as high-energy oscillation
-#define COGGING_HOLD_MS           500    // minimum time to hold cogging flag after last detection
 
 // =============================================================================
 // UWB — Makerfabs DW3000 AOA anchor (Qorvo DW3000, STM32F103C8T6)
@@ -88,7 +80,7 @@
 // Control
 // =============================================================================
 #define THROTTLE_SCALE      0.22f  // Max throttle (0.0–1.0)
-#define THROTTLE_Deadband   0.05f  // Minimum throttle before movement
+#define THROTTLE_Deadband   0.08f  // Minimum throttle before movement (ESC threshold = 1540µs)
 #define FOLLOW_DISTANCE_CM  200.0f // Distance at which car stops
 #define MAX_DISTANCE_CM     800.0f // Distance at which car runs at max speed
 #define MIN_SPEED_MPH 1.0f  // speed when tag is just past follow distance
@@ -97,25 +89,47 @@
 
 
 // =============================================================================
-// RPM
+// PWM (ESC + Steering Servo)
 // =============================================================================
-#define RPM_PULSES_PER_REV       1         // Hall effect pulses per motor shaft revolution
-#define RPM_SPEED_FACTOR         0.002017f // mph per motor RPM — tune until displayed speed matches a known reference
-#define RPM_STALE_MS             250       // Zero speed if no pulse received within this window
-#define RPM_KALMAN_Q             0.6f      // Process noise — how fast true speed can change per step
-#define RPM_KALMAN_R             0.3f      // Measurement noise — pulse period is clean so this is low
-#define RPM_SPIKE_REJECT_FACTOR  2.0f      // Reject pulse if instantaneous speed exceeds this multiple of current filtered speed
-#define RPM_SPIKE_MAX_STREAK     1         // Force-accept after this many consecutive rejections (prevents blocking genuine acceleration)
+#define PWM_NEUTRAL_US 1500
+#define PWM_MIN_US     1000
+#define PWM_MAX_US     2000
+
+// =============================================================================
+// RPM — hall-effect interrupt (speed + odometry) + AS5600 encoder (cogging detection)
+// =============================================================================
+
+// Hall-effect sensor (speed + odometry)
+#define RPM_STALE_MS             250       // zero speed if no pulse received within this window
+#define RPM_PULSES_PER_REV       2         // hall-effect pulses per motor shaft revolution
+#define RPM_HALL_SPEED_FACTOR    0.002017f // mph per motor RPM — retune if top speed reads wrong
+#define RPM_HALL_CM_PER_PULSE    (RPM_HALL_SPEED_FACTOR * 2682.24f / RPM_PULSES_PER_REV) // cm of wheel travel per hall pulse (~2.7 cm)
+#define RPM_EMA_ALPHA            0.3f      // EMA smoothing on speed output (0=frozen, 1=no smoothing)
+#define RPM_SPIKE_REJECT_FACTOR  2.0f      // Reject pulse if instantaneous speed exceeds this multiple of filtered speed
+#define RPM_SPIKE_MAX_STREAK     1         // Force-accept after this many consecutive rejections
+
+// AS5600 encoder (cogging detection only)
+#define AS5600_ADDR              0x36      // I2C address (fixed in hardware)
+#define AS5600_COUNTS_PER_REV    4096      // 12-bit absolute encoder resolution
+#define RPM_POLL_INTERVAL_MS     5         // poll AS5600 at 200 Hz
+#define RPM_CM_PER_COUNT         0.000616f // cm of wheel travel per AS5600 encoder count
+#define RPM_COGGING_FREQ_HZ      30.0f    // measured cogging oscillation frequency (bench test)
+#define RPM_COGGING_CYCLE_SAMPLES 7       // samples per cogging cycle: 1000 / (FREQ_HZ * POLL_MS)
+#define RPM_COGGING_WINDOW       (RPM_COGGING_CYCLE_SAMPLES * 3)  // analysis window: ~3 full cycles
+#define RPM_COGGING_MIN_SIGN_CHANGES 4     // direction reversals required to flag cogging
+#define RPM_COGGING_MAX_NET_COUNTS   1623  // max net displacement (counts) while flagging cogging (~1cm)
+#define RPM_COGGING_ENC_CLEAR_MPH  0.25f  // encoder EMA above this = net forward motion, not cogging
+#define RPM_COGGING_ENC_EMA_ALPHA  0.15f  // EMA alpha for encoder velocity used in state machine
+#define RPM_COGGING_MAX_SPEED_MPH  2.0f   // disable cogging detection above this hall-effect speed
 
 // =============================================================================
 // Throttle PID
 // =============================================================================
 #define CONTROL_UPDATE_INTERVAL_MS  20     // PID update rate (50 Hz)
 #define THROTTLE_SMOOTH_ALPHA       0.05f  // Exponential smoothing on throttle output (0=frozen, 1=no smoothing)
-#define THROTTLE_PID_KP             4.0f
+#define THROTTLE_PID_KP             2.0f
 #define THROTTLE_PID_KI             0.5f
 #define THROTTLE_PID_KD             0.0f
-#define THROTTLE_FF_K               0.0f   // Feed-forward: maps targetSpeedMph → throttle (normalized 0–1). Tune until FF alone holds ~target speed at steady state.
 #define STEERING_MAX                0.65f   // Max steering output (0.0–1.0) — caps servo deflection to prevent brownout
 #define STEERING_PID_KP             0.015f  // ≈ 1/90°: maps ±90° error to ±1.0 steering
 #define STEERING_PID_KI             0.004f

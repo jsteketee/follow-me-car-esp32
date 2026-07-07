@@ -7,12 +7,12 @@ struct Pose {
     float         camAngle;        // latest raw camera angle; NAN until first fix
     float         distanceCm;      // Kalman-filtered distance (cm); -1 if no valid UWB reading
     float         uwbDistCm;       // latest raw UWB distance (cm); -1 if no valid reading
-    float         fusedSpeedMph;   // RPM speed zeroed during cogging
-    float         fusedOdometryCm; // cumulative distance, not incremented during cogging
+    float         fusedSpeedMph;   // RPM speed (mph)
+    float         fusedOdometryCm; // cumulative wheel odometry (cm)
     unsigned long timestamp;       // millis() of last valid UWB or camera update
     float         uncertainty;     // bearing Kalman variance (deg²) — low = confident, high = stale/uncertain
 };
 
 void             fusion_init();
-void             fusion_update();
+bool             fusion_update();  // true when UWB or camera provided new data this call
 const Pose& fusion_get();

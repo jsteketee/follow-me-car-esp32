@@ -7,5 +7,5 @@ struct ControlOutput {
 };
 
 void control_init();
-void control_update();
+bool control_update();  // true when the PID rate gate fired and outputs were updated
 const ControlOutput& control_get();

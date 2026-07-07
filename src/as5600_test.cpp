@@ -16,6 +16,7 @@
 //   mon <hz>        — set monitor rate in Hz (0 = off)
 #include <Arduino.h>
 #include <Wire.h>
+#include <ESP32Servo.h>
 #include "esp_log.h"
 
 static const char* TAG = "as5600_test";
@@ -25,6 +26,23 @@ static const int SDA_PIN = 8;
 static const int SCL_PIN = 9;
 
 static const uint8_t AS5600_ADDR = 0x36;
+
+// Hall-effect sensor — original interrupt-driven speed measurement for comparison with AS5600.
+static const int    HALL_PIN            = 10;
+static const int    HALL_PULSES_PER_REV = 2;       // pulses per motor shaft revolution
+static const float  HALL_SPEED_FACTOR   = 0.002017f; // mph per motor RPM (pre-AS5600 calibration)
+static const uint32_t HALL_STALE_MS     = 250;
+
+static volatile uint32_t _hallLastUs   = 0;
+static volatile uint32_t _hallPeriodUs = 0;
+static volatile bool     _hallValid    = false;
+
+static void IRAM_ATTR onHallPulse() {
+    uint32_t now = micros();
+    if (_hallValid) _hallPeriodUs = now - _hallLastUs;
+    _hallLastUs = now;
+    _hallValid  = true;
+}
 
 // AS5600 register map (per datasheet). RAW_ANGLE is the unfiltered reading; ANGLE applies the chip's hysteresis/scaling.
 static const uint8_t REG_ZMCO      = 0x00;
@@ -41,6 +59,23 @@ static const uint8_t STATUS_MD = 1 << 5; // magnet detected
 
 static float    _monitorHz     = 4.0f;
 static uint32_t _lastMonitorMs = 0;
+
+// Cogging diagnostic state — delta buffer, EMA velocity, sign-change counter.
+static const int COG_WINDOW       = 25;      // samples (~1 cogging cycle at 8 Hz, 200 Hz poll)
+static const float COG_EMA_ALPHA  = 0.15f;
+static const float CM_PER_COUNT   = 0.000616f;  // must match config.h RPM_CM_PER_COUNT
+static int   _cogDeltas[COG_WINDOW] = {};
+static int   _cogIdx       = 0;
+static bool  _cogBufFull   = false;
+static float _cogEmaVelMph = 0.0f;
+static int   _lastAngle    = -1;
+
+// ESC control — same pin and PWM range as main firmware.
+static const int ESC_PIN     = 1;
+static const int PWM_MIN_US  = 1000;
+static const int PWM_MAX_US  = 2000;
+static const int PWM_NEUT_US = 1500;
+static Servo _esc;
 
 static char _cmdBuf[64];
 static int  _cmdLen = 0;
@@ -169,7 +204,16 @@ static void handle_command(char* line) {
         return;
     }
 
-    Serial.printf("unknown command: %s  (commands: scan, status, angle, r, w, mon)\n", line);
+    if (strncmp(line, "thr", 3) == 0) {
+        float val = atof(line + 3);
+        val = constrain(val, -1.0f, 1.0f);
+        int us = (int)(PWM_NEUT_US + val * 500.0f);
+        _esc.writeMicroseconds(us);
+        Serial.printf("throttle %.3f -> %d us\n", val, us);
+        return;
+    }
+
+    Serial.printf("unknown command: %s  (commands: scan, status, angle, r, w, mon, thr)\n", line);
 }
 
 // Accumulates USB serial input into a line buffer and dispatches completed commands.
@@ -203,10 +247,50 @@ static void poll_monitor() {
     int agc = as5600_read8(REG_AGC);
     int mag = as5600_read12(REG_MAGNITUDE);
     int raw = as5600_read12(REG_RAW_ANGLE);
+    int ang = as5600_read12(REG_ANGLE);
 
-    ESP_LOGI(TAG, "MON: MD=%d ML=%d MH=%d  AGC=%d  MAG=%d  RAW=%d (%.2f deg)",
+    // Snapshot volatile hall-effect state atomically.
+    uint32_t hallPeriodUs = _hallPeriodUs;
+    uint32_t hallLastUs   = _hallLastUs;
+    bool     hallStale    = (micros() - hallLastUs) > (HALL_STALE_MS * 1000UL);
+    float    hallSpeedMph = 0.0f;
+    if (!hallStale && hallPeriodUs > 0) {
+        float periodS  = hallPeriodUs / 1e6f;
+        float motorRpm = (60.0f / periodS) / HALL_PULSES_PER_REV;
+        hallSpeedMph   = motorRpm * HALL_SPEED_FACTOR;
+    }
+
+    // Cogging diagnostic: compute encoder delta, EMA velocity, and sign-change count.
+    int signChanges = 0;
+    if (_lastAngle >= 0) {
+        int delta = ang - _lastAngle;
+        if (delta >  2048) delta -= 4096;
+        if (delta < -2048) delta += 4096;
+        delta = -delta;  // negate: forward = positive
+
+        float dtS      = intervalMs / 1000.0f;
+        float rawVelMph = ((float)delta * CM_PER_COUNT / dtS) * 0.0223694f;
+        _cogEmaVelMph  += COG_EMA_ALPHA * (rawVelMph - _cogEmaVelMph);
+
+        _cogDeltas[_cogIdx] = delta;
+        _cogIdx = (_cogIdx + 1) % COG_WINDOW;
+        if (_cogIdx == 0) _cogBufFull = true;
+
+        int count = _cogBufFull ? COG_WINDOW : _cogIdx;
+        for (int i = 1; i < count; i++) {
+            if (_cogDeltas[i] != 0 && _cogDeltas[i-1] != 0 &&
+                (_cogDeltas[i] > 0) != (_cogDeltas[i-1] > 0)) {
+                signChanges++;
+            }
+        }
+    }
+    _lastAngle = ang;
+
+    ESP_LOGI(TAG, "MON: MD=%d ML=%d MH=%d  AGC=%d  MAG=%d  RAW=%d (%.2f deg)  ANGLE=%d (%.2f deg)  HALL=%.3f mph",
         (status & STATUS_MD) != 0, (status & STATUS_ML) != 0, (status & STATUS_MH) != 0,
-        agc, mag, raw, counts_to_deg(raw));
+        agc, mag, raw, counts_to_deg(raw), ang, counts_to_deg(ang), hallSpeedMph);
+    ESP_LOGI(TAG, "COG_DIAG: encVel=%.3fmph  signChanges=%d  hall=%.3fmph",
+        _cogEmaVelMph, signChanges, hallSpeedMph);
 }
 
 void setup() {
@@ -227,7 +311,16 @@ void setup() {
         ESP_LOGW(TAG, "AS5600 NOT found at 0x%02X — check wiring; `scan` lists visible devices", AS5600_ADDR);
     }
 
-    ESP_LOGI(TAG, "Step 3: console ready (commands: scan, status, angle, r, w, mon) — monitor at %.1f Hz", _monitorHz);
+    ESP_LOGI(TAG, "Step 3: attaching ESC on GPIO%d — neutral %d us", ESC_PIN, PWM_NEUT_US);
+    esp_log_level_set("ESP32Servo.cpp", ESP_LOG_ERROR);
+    _esc.attach(ESC_PIN, PWM_MIN_US, PWM_MAX_US);
+    _esc.writeMicroseconds(PWM_NEUT_US);
+
+    ESP_LOGI(TAG, "Step 4: attaching hall-effect interrupt on GPIO%d", HALL_PIN);
+    pinMode(HALL_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(HALL_PIN), onHallPulse, FALLING);
+
+    ESP_LOGI(TAG, "Step 4: console ready (commands: scan, status, angle, r, w, mon) — monitor at %.1f Hz", _monitorHz);
     ESP_LOGI(TAG, "======================================================");
 }
 

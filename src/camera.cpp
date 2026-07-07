@@ -10,7 +10,10 @@
 static const char* TAG = "camera";
 static CameraData _cameraData = {};
 static RateGate   _gate{ CAMERA_UPDATE_INTERVAL_MS };
+static RateGate   _retryGate{ 2000 };  // probe interval while waiting for camera to boot
+static bool       _ready = false;
 
+// Probes the I2C bus and logs every responding address.
 static void i2c_scan() {
     ESP_LOGI(TAG, "Scanning I2C bus...");
     bool found = false;
@@ -25,34 +28,44 @@ static void i2c_scan() {
 }
 
 bool camera_init() {
-    // Wire already started by oled_init(); pull-ups provided by OLED/IMU breakouts
+    // Wire already started by oled_init(); pull-ups provided by OLED/IMU breakouts.
+    // Single probe — don't block; camera_update() retries every 2s if not found.
     i2c_scan();
-
-    // Retry for up to 15s — XIAO takes ~8s to boot and run esp_camera_init
-    const int RETRIES = 30;
-    for (int i = 0; i < RETRIES; i++) {
-        Wire.beginTransmission(CAMERA_I2C_ADDR);
-        if (Wire.endTransmission() == 0) {
-            ESP_LOGI(TAG, "✅ Camera ready at I2C 0x%02X (attempt %d)", CAMERA_I2C_ADDR, i + 1);
-            return true;
-        }
-        ESP_LOGD(TAG, "Camera not ready, retrying (%d/%d)...", i + 1, RETRIES);
-        delay(500);
+    Wire.beginTransmission(CAMERA_I2C_ADDR);
+    _ready = (Wire.endTransmission() == 0);
+    if (_ready) {
+        ESP_LOGI(TAG, "✅ Camera ready at I2C 0x%02X", CAMERA_I2C_ADDR);
+    } else {
+        ESP_LOGW(TAG, "Camera not found at 0x%02X — will retry every 2s", CAMERA_I2C_ADDR);
     }
-    ESP_LOGE(TAG, "❌ Camera not found at I2C 0x%02X after %d attempts — disabled", CAMERA_I2C_ADDR, RETRIES);
-    return false;
+    // Always return true so camera_update() runs and can pick up a late-booting camera.
+    return true;
 }
 
-void camera_update() {
+bool camera_update() {
+    if (!_ready) {
+        // XIAO takes ~8s to boot; keep probing until it appears.
+        float dt;
+        if (!_retryGate.tick(dt)) return false;
+        Wire.beginTransmission(CAMERA_I2C_ADDR);
+        if (Wire.endTransmission() == 0) {
+            _ready = true;
+            ESP_LOGI(TAG, "✅ Camera found at I2C 0x%02X", CAMERA_I2C_ADDR);
+        } else {
+            ESP_LOGD(TAG, "Camera not yet ready at 0x%02X, retrying...", CAMERA_I2C_ADDR);
+        }
+        return false;
+    }
+
     float dt;
-    if (!_gate.tick(dt)) return;
+    if (!_gate.tick(dt)) return false;
 
     const int PAYLOAD = 9;
     Wire.requestFrom((uint8_t)CAMERA_I2C_ADDR, (uint8_t)PAYLOAD);
     if (Wire.available() < PAYLOAD) {
         ESP_LOGW(TAG, "⚠️ short read (%d/9 bytes)", Wire.available());
         while (Wire.available()) Wire.read();
-        return;
+        return false;
     }
 
     uint8_t buf[PAYLOAD];
@@ -72,6 +85,7 @@ void camera_update() {
         _cameraData.posY = posY;
     }
     _cameraData.timestamp = millis();
+    return true;
 }
 
 const CameraData& camera_get() { return _cameraData; }

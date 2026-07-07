@@ -142,10 +142,12 @@ void uwb_init() {
     }
 }
 
-void uwb_update() {
+bool uwb_update() {
+    unsigned long prevTs = _uwbData.timestamp;
     while (_dwSerial.available()) {
         process_byte((uint8_t)_dwSerial.read());
     }
+    return _uwbData.timestamp != prevTs;
 }
 
 const UWBReading& uwb_get() {

@@ -25,8 +25,7 @@ static unsigned long _lastUwbTimestamp    = 0;
 static unsigned long _lastCameraTimestamp = 0;
 static float         _lastOdometryCm      = 0.0f;
 static float         _fusedOdometryCm     = 0.0f;
-static float         _layMean             = 0.0f;
-static float         _layVariance         = 0.0f;
+static bool          _bearingSeeded       = false;
 
 // Update the absolute bearing estimate from a new relative angle measurement
 static void correct_bearing(float relAngle, float imuYaw, float r) {
@@ -54,39 +53,35 @@ static void correct_bearing(float relAngle, float imuYaw, float r) {
     _bearingP *= (1.0f - k);
 }
 
-// Detects motor cogging: high-variance, near-zero-mean forward acceleration
-// indicates the motor is oscillating without producing net forward movement.
-static bool detect_cogging(float lay) {
-    float dev     = lay - _layMean;
-    _layMean     += COGGING_LAY_MEAN_ALPHA * dev;
-    _layVariance += COGGING_LAY_VAR_ALPHA  * (dev * dev - _layVariance);
-    bool raw      = (fabsf(_layMean) < COGGING_MEAN_THRESHOLD)
-                 && (_layVariance    > COGGING_VAR_THRESHOLD);
-    static bool     _cogging     = false;
-    static uint32_t _lastTrueMs  = 0;
-    if (raw) _lastTrueMs = millis();
-    bool cogging = raw || (millis() - _lastTrueMs < COGGING_HOLD_MS);
-    if (cogging != _cogging) {
-        ESP_LOGI(TAG, "%s  mean=%.2f m/s²  var=%.2f (m/s²)²",
-            cogging ? "🔴 cogging detected" : "🟢 cogging cleared",
-            _layMean, _layVariance);
-        _cogging = cogging;
-    }
-    return cogging;
-}
 
 void fusion_init() {
-    ESP_LOGI(TAG, "✅ fusion ready  rUwb=%.1f  rCam=%.1f  stale=%.1f  innovMeanAlpha=%.3f  innovEwmaAlpha=%.3f",
-        rtConfig.fusionRUwb, rtConfig.fusionRCamera, rtConfig.fusionStaleUncertainty,
-        rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha);
+    // Seed the bearing from IMU heading captured during imu_init().
+    // imu_init() blocks until the first rotation vector arrives, so yaw should be valid here.
+    const ImuData& imu = imu_get();
+    if (!isnan(imu.yaw)) {
+        _bearingDeg   = imu.yaw;
+        _bearingSeeded = true;
+        ESP_LOGI(TAG, "✅ fusion ready  bearing seeded from IMU yaw=%.1f°  rUwb=%.1f  rCam=%.1f  stale=%.1f  innovMeanAlpha=%.3f  innovEwmaAlpha=%.3f",
+            imu.yaw, rtConfig.fusionRUwb, rtConfig.fusionRCamera, rtConfig.fusionStaleUncertainty,
+            rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha);
+    } else {
+        ESP_LOGW(TAG, "✅ fusion ready  (no IMU yaw — bearing will seed on first update)  rUwb=%.1f  rCam=%.1f",
+            rtConfig.fusionRUwb, rtConfig.fusionRCamera);
+    }
 }
 
-void fusion_update() {
+bool fusion_update() {
     const ImuData&    imu = imu_get();
     const UWBReading& uwb = uwb_get();
     const CameraData& cam = camera_get();
 
     uint32_t now = millis();
+
+    // Fallback seed in case fusion_init() didn't have a valid IMU yaw yet.
+    if (!_bearingSeeded && !isnan(imu.yaw)) {
+        _bearingDeg   = imu.yaw;
+        _bearingSeeded = true;
+    }
 
     // Grow bearing uncertainty every loop as data becomes stale.
     if (_lastUpdateMs > 0) {
@@ -95,16 +90,13 @@ void fusion_update() {
     }
     _lastUpdateMs = now;
 
-    // Perform Odom Dead reckoning gated by cogging detection. This updates distance in between UWB Readings. 
-    bool cogging = detect_cogging(imu.lay);
+    // Dead reckoning: update distance estimate from wheel odometry between UWB readings.
     float rpmOdom = rpm_get().odometryCm;
     float traveled = rpmOdom - _lastOdometryCm;
     _lastOdometryCm = rpmOdom;
-    if (!cogging) {
-        _fusedOdometryCm += traveled;
-        if (_distKalman.initialized)
-            _distKalman.x = fmaxf(0.0f, _distKalman.x - traveled);
-    }
+    _fusedOdometryCm += traveled;
+    if (_distKalman.initialized)
+        _distKalman.x = fmaxf(0.0f, _distKalman.x - traveled);
     _fusedPose.distanceCm = _distKalman.initialized ? _distKalman.x : -1.0f;
 
 
@@ -147,7 +139,7 @@ void fusion_update() {
 
     // Update uncertainty and speed
     _fusedPose.uncertainty     = _bearingP + _innovEwma;
-    _fusedPose.fusedSpeedMph   = cogging ? 0.0f : rpm_get().speedMph;
+    _fusedPose.fusedSpeedMph   = rpm_get().speedMph;
     _fusedPose.fusedOdometryCm = _fusedOdometryCm;
 
     // Log updates to serial for debugging
@@ -155,10 +147,11 @@ void fusion_update() {
         const char* src = (uwbUpdated && camUpdated) ? "📡 uwb + 📷 blob"
                         : uwbUpdated                 ? "📡 uwb"
                                                      : "📷 blob";
-        ESP_LOGI(TAG, "bearing=%.1f°  angle=%.1f°  uwbRaw=%.1f°  dist=%.0fcm  rawDist=%.0fcm  unc=%.1f  src=%s",
+        ESP_LOGD(TAG, "bearing=%.1f°  angle=%.1f°  uwbRaw=%.1f°  dist=%.0fcm  rawDist=%.0fcm  unc=%.1f  src=%s",
             _bearingDeg, _fusedPose.fusedAngle, _fusedPose.uwbAngle,
             _fusedPose.distanceCm, _fusedPose.uwbDistCm, _fusedPose.uncertainty, src);
     }
+    return uwbUpdated || camUpdated;
 }
 
 const Pose& fusion_get() { return _fusedPose; }

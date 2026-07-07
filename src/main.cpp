@@ -17,28 +17,59 @@
 static const char* TAG = "perf";
 static HzTracker   loopHz;
 
-static PerfTracker perfImu, perfUwb, perfNav, perfCtrl, perfOled, perfWifi;
-static bool        cameraOk = false;
-static uint32_t    lastReport = 0;
+// Execution time per module (avg/max µs over the reporting window).
+static PerfTracker perfImu, perfUwb, perfCam, perfFusion, perfNav,
+                   perfCtrl, perfOled, perfWifi, perfRpm, perfDash;
+
+// New-data poll rate for actual sensors only (not fusion, nav, control, etc.).
+// IMU poll rate is exposed via imu_get().update_hz (tracked internally by imu_update).
+static HzTracker hzUwb, hzCam, hzRpm;
+
+static uint32_t lastReport = 0;
 
 static void perf_report(float lps) {
     if (millis() - lastReport < 1000) return;
-    Serial.printf("[perf] lps=%.0f  imu=%u/%u  uwb=%u/%u  nav=%u/%u  ctrl=%u/%u  oled=%u/%u  wifi=%u/%u  (avg/max us)\n",
+    const ImuData& imu = imu_get();
+
+    Serial.printf(
+        "[loop perf] lps=%.0f"
+        "  imu=%u/%u"
+        "  uwb=%u/%u"
+        "  cam=%u/%u"
+        "  fus=%u/%u"
+        "  nav=%u/%u"
+        "  ctrl=%u/%u"
+        "  oled=%u/%u"
+        "  wifi=%u/%u"
+        "  rpm=%u/%u"
+        "  dash=%u/%u"
+        "  (avg/max us)\n",
         lps,
-        perfImu.avg(),  perfImu.maxUs,
-        perfUwb.avg(),  perfUwb.maxUs,
-        perfNav.avg(),  perfNav.maxUs,
-        perfCtrl.avg(), perfCtrl.maxUs,
-        perfOled.avg(), perfOled.maxUs,
-        perfWifi.avg(), perfWifi.maxUs);
-    dashboard_set_perf({ perfImu.avg(),  perfImu.maxUs,
-                         perfUwb.avg(),  perfUwb.maxUs,
-                         perfNav.avg(),  perfNav.maxUs,
-                         perfCtrl.avg(), perfCtrl.maxUs,
-                         perfOled.avg(), perfOled.maxUs,
-                         perfWifi.avg(), perfWifi.maxUs });
-    perfImu.reset(); perfUwb.reset(); perfNav.reset();
-    perfCtrl.reset(); perfOled.reset(); perfWifi.reset();
+        perfImu.avg(),    perfImu.maxUs,
+        perfUwb.avg(),    perfUwb.maxUs,
+        perfCam.avg(),    perfCam.maxUs,
+        perfFusion.avg(), perfFusion.maxUs,
+        perfNav.avg(),    perfNav.maxUs,
+        perfCtrl.avg(),   perfCtrl.maxUs,
+        perfOled.avg(),   perfOled.maxUs,
+        perfWifi.avg(),   perfWifi.maxUs,
+        perfRpm.avg(),    perfRpm.maxUs,
+        perfDash.avg(),   perfDash.maxUs);
+
+    Serial.printf(
+        "[sensor perf] imu=%.0fHz  uwb=%.0fHz  cam=%.0fHz  rpm=%.0fHz\n",
+        (float)imu.update_hz, hzUwb.hz, hzCam.hz, hzRpm.hz);
+
+    dashboard_set_perf({ perfImu.avg(),    perfImu.maxUs,
+                         perfUwb.avg(),    perfUwb.maxUs,
+                         perfNav.avg(),    perfNav.maxUs,
+                         perfCtrl.avg(),   perfCtrl.maxUs,
+                         perfOled.avg(),   perfOled.maxUs,
+                         perfWifi.avg(),   perfWifi.maxUs });
+
+    perfImu.reset();    perfUwb.reset();  perfCam.reset();    perfFusion.reset();
+    perfNav.reset();    perfCtrl.reset(); perfOled.reset();   perfWifi.reset();
+    perfRpm.reset();    perfDash.reset();
     lastReport = millis();
 }
 
@@ -57,7 +88,7 @@ void setup()
     rpm_init();
     dashboard_init();
 #ifndef CAMERA_DISABLED
-    cameraOk = camera_init();
+    camera_init();
 #endif
     fusion_init();
 
@@ -69,17 +100,17 @@ void loop()
 {
     loopHz.update();
 
-    perfImu.begin();  imu_update();               perfImu.end();
-    perfUwb.begin();  uwb_update();               perfUwb.end();
+    perfImu.begin();    imu_update();                              perfImu.end();
+    perfUwb.begin();    hzUwb.update(uwb_update());               perfUwb.end();
 #ifndef CAMERA_DISABLED
-    if (cameraOk) camera_update();
+    perfCam.begin();    hzCam.update(camera_update());            perfCam.end();
 #endif
-    fusion_update();
-    perfNav.begin();  nav_update();               perfNav.end();
-    perfCtrl.begin(); control_update();           perfCtrl.end();
-    perfOled.begin(); oled_update(loopHz.hz);     perfOled.end();
-    perfWifi.begin(); wifi_update();              perfWifi.end();
-    rpm_update();
-    dashboard_update(loopHz.hz);
+    perfFusion.begin(); fusion_update();                          perfFusion.end();
+    perfNav.begin();    nav_update();                             perfNav.end();
+    perfCtrl.begin();   control_update();                         perfCtrl.end();
+    perfOled.begin();   oled_update(loopHz.hz);                   perfOled.end();
+    perfWifi.begin();   wifi_update();                            perfWifi.end();
+    perfRpm.begin();    hzRpm.update(rpm_update());               perfRpm.end();
+    perfDash.begin();   dashboard_update(loopHz.hz);              perfDash.end();
     perf_report(loopHz.hz);
 }
