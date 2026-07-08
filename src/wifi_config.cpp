@@ -22,9 +22,9 @@ void wifi_init() {
     ArduinoOTA.begin();
 
     telnetServer.begin();
-    ESP_LOGI(TAG, "[wifi] ✅ AP ready — SSID: %s  IP: %s  -> nc %s.local %d",
-             WIFI_AP_SSID, WiFi.softAPIP().toString().c_str(),
-             WIFI_HOSTNAME, TELNET_PORT);
+    Serial.printf("[%s] ✅ AP ready — SSID: %s  IP: %s  -> nc %s.local %d\n",
+                  TAG, WIFI_AP_SSID, WiFi.softAPIP().toString().c_str(),
+                  WIFI_HOSTNAME, TELNET_PORT);
 }
 
 void wifi_update() {

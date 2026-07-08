@@ -136,9 +136,9 @@ void uwb_init() {
     }
 
     if (_uwbData.timestamp > 0) {
-        ESP_LOGI(TAG, "✅ DW3000 ready  angle=%.1f°  dist=%.0fcm", _uwbData.angleDeg, _uwbData.distCm);
+        Serial.printf("[%s] ✅ DW3000 ready  angle=%.1f°  dist=%.0fcm\n", TAG, _uwbData.angleDeg, _uwbData.distCm);
     } else {
-        ESP_LOGE(TAG, "❌ DW3000 no frames in 2s — check wiring (RX=GPIO%d TX=GPIO%d)", PIN_DW3000_RX, PIN_DW3000_TX);
+        Serial.printf("[%s] ❌ DW3000 no frames in 2s — check wiring (RX=GPIO%d TX=GPIO%d)\n", TAG, PIN_DW3000_RX, PIN_DW3000_TX);
     }
 }
 

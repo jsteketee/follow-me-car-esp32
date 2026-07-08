@@ -12,6 +12,7 @@
 #include "dashboard.h"
 #include "camera.h"
 #include "fusion.h"
+#include "serial_hal.h"
 #include "esp_log.h"
 
 static const char* TAG = "perf";
@@ -19,7 +20,7 @@ static HzTracker   loopHz;
 
 // Execution time per module (avg/max µs over the reporting window).
 static PerfTracker perfImu, perfUwb, perfCam, perfFusion, perfNav,
-                   perfCtrl, perfOled, perfWifi, perfRpm, perfDash;
+                   perfCtrl, perfOled, perfWifi, perfRpm, perfDash, perfSerial;
 
 // New-data poll rate for actual sensors only (not fusion, nav, control, etc.).
 // IMU poll rate is exposed via imu_get().update_hz (tracked internally by imu_update).
@@ -69,7 +70,7 @@ static void perf_report(float lps) {
 
     perfImu.reset();    perfUwb.reset();  perfCam.reset();    perfFusion.reset();
     perfNav.reset();    perfCtrl.reset(); perfOled.reset();   perfWifi.reset();
-    perfRpm.reset();    perfDash.reset();
+    perfRpm.reset();    perfDash.reset(); perfSerial.reset();
     lastReport = millis();
 }
 
@@ -87,10 +88,12 @@ void setup()
     control_init();
     rpm_init();
     dashboard_init();
-#ifndef CAMERA_DISABLED
-    camera_init();
-#endif
+// Camera unused for the foreseeable future — commented out rather than removed.
+// #ifndef CAMERA_DISABLED
+//     camera_init();
+// #endif
     fusion_init();
+    serial_hal_init();
 
     nav_set_mode(DEFAULT_NAV_MODE);
     Serial.println("⭐⭐⭐⭐⭐ Setup Complete ⭐⭐⭐⭐⭐");
@@ -102,9 +105,10 @@ void loop()
 
     perfImu.begin();    imu_update();                              perfImu.end();
     perfUwb.begin();    hzUwb.update(uwb_update());               perfUwb.end();
-#ifndef CAMERA_DISABLED
-    perfCam.begin();    hzCam.update(camera_update());            perfCam.end();
-#endif
+// Camera unused for the foreseeable future — commented out rather than removed.
+// #ifndef CAMERA_DISABLED
+//     perfCam.begin();    hzCam.update(camera_update());            perfCam.end();
+// #endif
     perfFusion.begin(); fusion_update();                          perfFusion.end();
     perfNav.begin();    nav_update();                             perfNav.end();
     perfCtrl.begin();   control_update();                         perfCtrl.end();
@@ -112,5 +116,6 @@ void loop()
     perfWifi.begin();   wifi_update();                            perfWifi.end();
     perfRpm.begin();    hzRpm.update(rpm_update());               perfRpm.end();
     perfDash.begin();   dashboard_update(loopHz.hz);              perfDash.end();
+    perfSerial.begin(); serial_hal_update();                      perfSerial.end();
     perf_report(loopHz.hz);
 }

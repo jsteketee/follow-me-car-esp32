@@ -61,12 +61,12 @@ void fusion_init() {
     if (!isnan(imu.yaw)) {
         _bearingDeg   = imu.yaw;
         _bearingSeeded = true;
-        ESP_LOGI(TAG, "✅ fusion ready  bearing seeded from IMU yaw=%.1f°  rUwb=%.1f  rCam=%.1f  stale=%.1f  innovMeanAlpha=%.3f  innovEwmaAlpha=%.3f",
-            imu.yaw, rtConfig.fusionRUwb, rtConfig.fusionRCamera, rtConfig.fusionStaleUncertainty,
+        Serial.printf("[%s] ✅ fusion ready  bearing seeded from IMU yaw=%.1f°  rUwb=%.1f  rCam=%.1f  stale=%.1f  innovMeanAlpha=%.3f  innovEwmaAlpha=%.3f\n",
+            TAG, imu.yaw, rtConfig.fusionRUwb, rtConfig.fusionRCamera, rtConfig.fusionStaleUncertainty,
             rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha);
     } else {
-        ESP_LOGW(TAG, "✅ fusion ready  (no IMU yaw — bearing will seed on first update)  rUwb=%.1f  rCam=%.1f",
-            rtConfig.fusionRUwb, rtConfig.fusionRCamera);
+        Serial.printf("[%s] ✅ fusion ready  (no IMU yaw — bearing will seed on first update)  rUwb=%.1f  rCam=%.1f\n",
+            TAG, rtConfig.fusionRUwb, rtConfig.fusionRCamera);
     }
 }
 

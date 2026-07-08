@@ -23,21 +23,20 @@ static uint32_t  _frameCount = 0;
 void oled_init() {
     Wire.setPins(PIN_SDA, PIN_SCL);
     if (!_oledDisplay.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        ESP_LOGE(TAG, "❌ OLED not found");
+        Serial.printf("[%s] ❌ OLED not found\n", TAG);
         while (true);
     }
     Wire.setClock(400000);
-    ESP_LOGI(TAG, "✅ OLED ready");
+    Serial.printf("[%s] ✅ OLED ready\n", TAG);
     _oledDisplay.clearDisplay();
     _oledDisplay.display();
 }
 
 static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long navTimestamp) {
-    const int cx = 96, cy = 32, r = 28;
+    // Pivot centered in the top-right box (x 79..127, y 0..49): the arrow's
+    // 24px reach fits the box in every direction.
+    const int cx = 103, cy = 24, r = 28;
     const int bodyLen = 18, headLen = 6, headWidth = 4;
-
-    // top half only: 0x1=upper-left, 0x2=upper-right
-    _oledDisplay.drawCircleHelper(cx, cy, r, 0x1 | 0x2, SSD1306_WHITE);
 
     if (isnan(tagHeading)) return;
     // 0° = straight ahead (up on screen), positive = right
@@ -45,7 +44,7 @@ static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long na
     float dx = cosf(angle), dy = sinf(angle);
     float px = -dy,         py = dx;
 
-    int sx = cx + (int)(dx * r / 2), sy = cy + (int)(dy * r / 2); // start at midpoint
+    int sx = cx + (int)(dx * r / 4), sy = cy + (int)(dy * r / 4); // longer tail: start at quarter radius
     int bx = cx + (int)(dx * bodyLen), by = cy + (int)(dy * bodyLen);
     int tx = bx + (int)(dx * headLen), ty = by + (int)(dy * headLen);
     int lx = bx + (int)(px * headWidth), ly = by + (int)(py * headWidth);
@@ -113,9 +112,6 @@ static void screen_1(float lps, const NavData& nav, const Pose& fused, const Con
 }
 
 static void screen_2(float lps, const NavData& nav, const Pose& fused, const ControlOutput& output, const RPMData& rpm) {
-    if (nav.mode == NavMode::FOLLOW_ME && nav.sensorsValid)
-        _oledDisplay.drawRect(0, 0, OLED_WIDTH, OLED_HEIGHT, SSD1306_WHITE);
-
     const int barW = 12, barMargin = 2, barSpacing = 4;
     // barFloor: bottom pixel of bars — reserves 8px text row + 1px gap beneath
     const int barFloor = OLED_HEIGHT - 10;
@@ -143,38 +139,79 @@ static void screen_2(float lps, const NavData& nav, const Pose& fused, const Con
     if (tgtBarH > 0)
         _oledDisplay.drawRect(tgtBarX, barFloor - tgtBarH + 1, barW, tgtBarH, SSD1306_WHITE);
 
-    drawHeadingArrow(fused.fusedAngle, fused.distanceCm, fused.timestamp);
+    // Full-height outlines for all three bars, drawn within each bar's existing width.
+    _oledDisplay.drawRect(barMargin, 0, barW, barFloor + 1, SSD1306_WHITE);
+    _oledDisplay.drawRect(uncBarX,   0, barW, barFloor + 1, SSD1306_WHITE);
+    _oledDisplay.drawRect(tgtBarX,   0, barW, barFloor + 1, SSD1306_WHITE);
 
-    _oledDisplay.setTextSize(2);
-    _oledDisplay.setTextColor(SSD1306_WHITE);
-    if (!isnan(fused.distanceCm) && fused.distanceCm >= 0) {
-        char distBuf[8];
-        snprintf(distBuf, sizeof(distBuf), "%dcm", (int)fused.distanceCm);
-        int textW = strlen(distBuf) * 12;
-        _oledDisplay.setCursor(96 - textW / 2, 38);
-        _oledDisplay.print(distBuf);
-    }
+    drawHeadingArrow(fused.fusedAngle, fused.distanceCm, fused.timestamp);
 
     _oledDisplay.setTextSize(1);
     _oledDisplay.setTextColor(SSD1306_WHITE);
-    _oledDisplay.setCursor(2, barFloor + 2);
+    // distX: left edge of the distance line; odometry aligns to it ("O" directly under "D").
+    // Default matches a typical 6-char "D:1.1m" reading when no distance is available.
+    int distX = 103 - (6 * 6) / 2;
+    if (!isnan(fused.distanceCm) && fused.distanceCm >= 0) {
+        // Meters with one decimal, centered under the compass, clamped to the right edge.
+        char distBuf[10];
+        snprintf(distBuf, sizeof(distBuf), "D %.1fm", fused.distanceCm / 100.0f);
+        int textW = strlen(distBuf) * 6;
+        distX = 103 - textW / 2;
+        if (distX + textW > OLED_WIDTH) distX = OLED_WIDTH - textW;
+        _oledDisplay.setCursor(distX, 27);
+        _oledDisplay.print(distBuf);
+    } else {
+        // No distance fix yet — show a placeholder so the block isn't blank.
+        _oledDisplay.setCursor(distX, 27);
+        _oledDisplay.print("D n/a");
+    }
+
+    // Separator between the distance and odometry lines — extends to 2px shy of the box's right border.
+    _oledDisplay.drawFastHLine(distX, 36, 126 - distX, SSD1306_WHITE);
+
+    // Odometry in centimeters — displayed for distance calibration
+    char odoBuf[12];
+    snprintf(odoBuf, sizeof(odoBuf), "O %.0f", rpm.odometryCm);
+    _oledDisplay.setCursor(distX, 39);
+    _oledDisplay.print(odoBuf);
+
+    _oledDisplay.setTextSize(1);
+    _oledDisplay.setTextColor(SSD1306_WHITE);
+
+    // Bar labels, aligned under each bar: throttle, uncertainty, set speed
+    _oledDisplay.setCursor(barMargin, barFloor + 2);
+    _oledDisplay.print("Tr");
+    _oledDisplay.setCursor(uncBarX, barFloor + 2);
+    _oledDisplay.print("Uc");
+    _oledDisplay.setCursor(tgtBarX, barFloor + 2);
+    _oledDisplay.print("Ss");
+
+    // Vertical divider centered between the Flag column (ends x=74) and the distance text (starts ~x=83).
+    _oledDisplay.drawFastVLine(78, 0, OLED_HEIGHT, SSD1306_WHITE);
+
+    // Horizontal divider off the vertical bar, 1px of separation above the bottom-aligned mode text.
+    _oledDisplay.drawFastHLine(78, 54, OLED_WIDTH - 78, SSD1306_WHITE);
+
+    // Flag label on the bottom line with a bar above it; COG sits on top of that bar when active.
+    _oledDisplay.setCursor(50, barFloor + 2);
+    _oledDisplay.print("Flag");
+    _oledDisplay.drawFastHLine(50, barFloor, 24, SSD1306_WHITE);
+    if (rpm.cogging) {
+        _oledDisplay.setCursor(50, barFloor - 9);
+        _oledDisplay.print("COG");
+        // Slow-blinking asterisk after COG (~1 Hz, 500ms on/off).
+        if ((millis() / 500) % 2 == 0) {
+            _oledDisplay.print("*");
+        }
+    }
+
+    // Nav mode — horizontally centered in the bottom-right box, bottom aligned to the screen edge.
     const char* modeStr =
         nav.mode == NavMode::FOLLOW_ME ? "FOLLOW" :
         nav.mode == NavMode::TEST      ? "TEST"   :
                                          "STOP";
+    _oledDisplay.setCursor(79 + (OLED_WIDTH - 79 - (int)strlen(modeStr) * 6) / 2, 56);
     _oledDisplay.print(modeStr);
-
-    // Odometry in centimeters — displayed for distance calibration
-    char odoBuf[10];
-    snprintf(odoBuf, sizeof(odoBuf), "%.0f", rpm.odometryCm);
-    _oledDisplay.setCursor(72, barFloor + 2);
-    _oledDisplay.print(odoBuf);
-
-    // Cogging indicator — bottom right
-    if (rpm.cogging) {
-        _oledDisplay.setCursor(104, barFloor + 2);
-        _oledDisplay.print("COG");
-    }
 }
 
 void oled_update(float lps) {

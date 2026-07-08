@@ -43,7 +43,7 @@ void imu_init()
 {
     if (!bno.begin_I2C(0x4B))
     {
-        ESP_LOGE(TAG, "❌ BNO085 not found");
+        Serial.printf("[%s] ❌ BNO085 not found\n", TAG);
         return;
     }
     enableReports();
@@ -65,7 +65,7 @@ void imu_init()
             // Consume the power-on reset flag so imu_update() doesn't log a spurious reset warning.
             bno.wasReset();
             imu_ready = true;
-            ESP_LOGI(TAG, "✅ BNO085 ready  yaw=%.1f°  cal=%d/3", _imuData.yaw, _imuData.cal_rot);
+            Serial.printf("[%s] ✅ BNO085 ready  yaw=%.1f°  cal=%d/3\n", TAG, _imuData.yaw, _imuData.cal_rot);
             return;
         }
         delay(1);
@@ -73,7 +73,7 @@ void imu_init()
     // Consume the power-on reset flag so imu_update() doesn't log a spurious reset warning.
     bno.wasReset();
     imu_ready = true;
-    ESP_LOGW(TAG, "⚠️ BNO085 init timeout — no rotation vector in 3s, yaw will be invalid");
+    Serial.printf("[%s] ⚠️ BNO085 init timeout — no rotation vector in 3s, yaw will be invalid\n", TAG);
 }
 
 // Need to figure this out.

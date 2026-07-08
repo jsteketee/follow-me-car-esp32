@@ -34,9 +34,9 @@ bool camera_init() {
     Wire.beginTransmission(CAMERA_I2C_ADDR);
     _ready = (Wire.endTransmission() == 0);
     if (_ready) {
-        ESP_LOGI(TAG, "✅ Camera ready at I2C 0x%02X", CAMERA_I2C_ADDR);
+        Serial.printf("[%s] ✅ Camera ready at I2C 0x%02X\n", TAG, CAMERA_I2C_ADDR);
     } else {
-        ESP_LOGW(TAG, "Camera not found at 0x%02X — will retry every 2s", CAMERA_I2C_ADDR);
+        Serial.printf("[%s] ⚠️ Camera not found at 0x%02X — will retry every 2s\n", TAG, CAMERA_I2C_ADDR);
     }
     // Always return true so camera_update() runs and can pick up a late-booting camera.
     return true;

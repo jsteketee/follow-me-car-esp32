@@ -697,7 +697,7 @@ void dashboard_init() {
     });
     _server.addHandler(&_webSocket);
     _server.begin();
-    ESP_LOGI(TAG, "✅ Dashboard at http://192.168.4.1/");
+    Serial.printf("[%s] ✅ Dashboard at http://192.168.4.1/\n", TAG);
 }
 
 static float    safeF(float v) { return isnan(v) || isinf(v) ? 0.0f : v; }

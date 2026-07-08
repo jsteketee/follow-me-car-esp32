@@ -29,7 +29,7 @@ void control_init() {
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, LOW);
     actuators_init();
-    ESP_LOGI(TAG, "✅ control ready");
+    Serial.printf("[%s] ✅ control ready\n", TAG);
 }
 
 // Runs PID controllers and mode logic, then sends normalized outputs to actuators.
@@ -45,8 +45,6 @@ bool control_update() {
     _throttlePid.kd = rtConfig.kd;
     _steeringPid.kp = rtConfig.steeringKp;
     _steeringPid.ki = rtConfig.steeringKi;
-
-    digitalWrite(PIN_LED, nav.mode == NavMode::FOLLOW_ME ? HIGH : LOW);
 
     // Freeze angle at last valid reading so steering holds course during sensor dropout.
     static float _lastValidAngle = 0.0f;
@@ -117,6 +115,12 @@ bool control_update() {
             _controlOutput.throttle = 0.0f;
         }
     }
+
+    // LED on whenever the car is trying to drive: nonzero set speed, or nonzero
+    // direct throttle in THROTTLE_TEST (which bypasses the target-speed path).
+    bool driving = directMode ? (_controlOutput.throttle != 0.0f)
+                              : (_controlOutput.targetSpeedMph > 0.0f);
+    digitalWrite(PIN_LED, driving ? HIGH : LOW);
 
     actuators_set(_controlOutput.throttle, _controlOutput.steering);
     return pidTick;

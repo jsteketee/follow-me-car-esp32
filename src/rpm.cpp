@@ -177,6 +177,7 @@ static bool update_encoder() {
     // EMA encoder velocity in mph — forward positive, backward negative.
     float rawVelMph = ((float)(-delta) * RPM_CM_PER_COUNT / (RPM_POLL_INTERVAL_MS / 1000.0f)) * 0.0223694f;
     _encEmaVelocityMph += RPM_COGGING_ENC_EMA_ALPHA * (rawVelMph - _encEmaVelocityMph);
+    _rpmData.encSpeedMph = _encEmaVelocityMph;
 
     // Push delta into circular buffer.
     _coggingDeltas[_coggingIdx] = delta;
@@ -300,14 +301,14 @@ void rpm_init() {
     // Hall-effect: configure pin and attach falling-edge interrupt.
     pinMode(PIN_RPM, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(PIN_RPM), on_hall_pulse, FALLING);
-    ESP_LOGI(TAG, "✅ hall-effect sensor ready on pin %d", PIN_RPM);
+    Serial.printf("[%s] ✅ hall-effect sensor ready on pin %d\n", TAG, PIN_RPM);
 
     // Encoder: Wire already open from oled_init(); just probe the device.
     Wire.beginTransmission(AS5600_ADDR);
     if (Wire.endTransmission() != 0) {
-        ESP_LOGE(TAG, "❌ AS5600 not found at 0x%02X — check wiring", AS5600_ADDR);
+        Serial.printf("[%s] ❌ AS5600 not found at 0x%02X — check wiring\n", TAG, AS5600_ADDR);
     } else {
-        ESP_LOGI(TAG, "✅ AS5600 encoder ready at 0x%02X (cogging detection)", AS5600_ADDR);
+        Serial.printf("[%s] ✅ AS5600 encoder ready at 0x%02X (cogging detection)\n", TAG, AS5600_ADDR);
         check_magnet_status();
     }
 }

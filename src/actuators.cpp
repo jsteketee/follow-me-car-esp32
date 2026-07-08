@@ -28,8 +28,8 @@ void actuators_init() {
     steerServo.attach(PIN_SERVO, PWM_MIN_US, PWM_MAX_US);
     escServo.writeMicroseconds(PWM_NEUTRAL_US);
     steerServo.writeMicroseconds(PWM_NEUTRAL_US);
-    ESP_LOGI(TAG, "✅ ESC (pin %d) + Servo (pin %d) ready — neutral %d µs",
-             PIN_ESC, PIN_SERVO, PWM_NEUTRAL_US);
+    Serial.printf("[%s] ✅ ESC (pin %d) + Servo (pin %d) ready — neutral %d µs\n",
+                  TAG, PIN_ESC, PIN_SERVO, PWM_NEUTRAL_US);
 }
 
 // Accepts [-1, 1] throttle and steering, applies all hardware transforms, and writes to servos.

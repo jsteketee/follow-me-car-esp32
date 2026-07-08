@@ -50,7 +50,7 @@
 #define OLED_WIDTH              128
 #define OLED_HEIGHT              64
 #define OLED_ADDR              0x3C
-#define OLED_UPDATE_INTERVAL_MS 100
+#define OLED_UPDATE_INTERVAL_MS 200
 
 // =============================================================================
 // SENSORS
@@ -130,7 +130,7 @@
 #define THROTTLE_PID_KP             2.0f
 #define THROTTLE_PID_KI             0.5f
 #define THROTTLE_PID_KD             0.0f
-#define STEERING_MAX                0.65f   // Max steering output (0.0–1.0) — caps servo deflection to prevent brownout
+#define STEERING_MAX                1.0f   // Max steering output (0.0–1.0) — caps servo deflection to prevent brownout
 #define STEERING_PID_KP             0.015f  // ≈ 1/90°: maps ±90° error to ±1.0 steering
 #define STEERING_PID_KI             0.004f
 #define STEERING_PID_KD             0.002f
