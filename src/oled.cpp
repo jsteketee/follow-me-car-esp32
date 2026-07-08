@@ -148,32 +148,34 @@ static void screen_2(float lps, const NavData& nav, const Pose& fused, const Con
 
     _oledDisplay.setTextSize(1);
     _oledDisplay.setTextColor(SSD1306_WHITE);
-    // distX: left edge of the distance line; odometry aligns to it ("O" directly under "D").
-    // Default matches a typical 6-char "D:1.1m" reading when no distance is available.
-    int distX = 103 - (6 * 6) / 2;
-    if (!isnan(fused.distanceCm) && fused.distanceCm >= 0) {
-        // Meters with one decimal, centered under the compass, clamped to the right edge.
-        char distBuf[10];
-        snprintf(distBuf, sizeof(distBuf), "D %.1fm", fused.distanceCm / 100.0f);
-        int textW = strlen(distBuf) * 6;
-        distX = 103 - textW / 2;
-        if (distX + textW > OLED_WIDTH) distX = OLED_WIDTH - textW;
-        _oledDisplay.setCursor(distX, 27);
-        _oledDisplay.print(distBuf);
-    } else {
-        // No distance fix yet — show a placeholder so the block isn't blank.
-        _oledDisplay.setCursor(distX, 27);
-        _oledDisplay.print("D n/a");
-    }
+    // Distance (meters, top) and odometry (cm, bottom): bare size-2 values,
+    // centered horizontally in the box (x 79..127, center 103).
+    const int boxX = 79;
+    char valBuf[8];
+    if (!isnan(fused.distanceCm) && fused.distanceCm >= 0)
+        snprintf(valBuf, sizeof(valBuf), "%.1f", fused.distanceCm / 100.0f);
+    else
+        snprintf(valBuf, sizeof(valBuf), "-");  // no distance fix yet
+    _oledDisplay.setTextSize(2);
+    // Visible width: 12px per char advance, minus the 2px trailing gap of the last char.
+    int distW = (int)strlen(valBuf) * 12 - 2;
+    int distTX = 103 - distW / 2;
+    if (distTX < boxX) distTX = boxX;
+    _oledDisplay.setCursor(distTX, 17);
+    _oledDisplay.print(valBuf);
 
     // Separator between the distance and odometry lines — extends to 2px shy of the box's right border.
-    _oledDisplay.drawFastHLine(distX, 36, 126 - distX, SSD1306_WHITE);
+    _oledDisplay.drawFastHLine(boxX, 35, 126 - boxX, SSD1306_WHITE);
 
     // Odometry in centimeters — displayed for distance calibration
-    char odoBuf[12];
-    snprintf(odoBuf, sizeof(odoBuf), "O %.0f", rpm.odometryCm);
-    _oledDisplay.setCursor(distX, 39);
+    char odoBuf[8];
+    snprintf(odoBuf, sizeof(odoBuf), "%.0f", rpm.odometryCm);
+    int odoW = (int)strlen(odoBuf) * 12 - 2;
+    int odoTX = 103 - odoW / 2;
+    if (odoTX < boxX) odoTX = boxX;
+    _oledDisplay.setCursor(odoTX, 38);
     _oledDisplay.print(odoBuf);
+    _oledDisplay.setTextSize(1);
 
     _oledDisplay.setTextSize(1);
     _oledDisplay.setTextColor(SSD1306_WHITE);
