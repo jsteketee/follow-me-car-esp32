@@ -67,7 +67,6 @@ bool control_update() {
     //
     switch (nav.mode) {
         case NavMode::FOLLOW_ME:
-            //Todo Need to integrate heading change and use to adjust steering between waypoint measurements.
             steeringSetpoint = 0.0f;
             steeringMeasure  = _lastValidAngle;
             if (nav.sensorsValid && pose.distanceCm > rtConfig.followDistanceCm) {

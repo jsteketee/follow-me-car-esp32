@@ -1,5 +1,8 @@
 #pragma once
 
+// Ordered to follow the data flow: pins → comms → sensors → display → fusion →
+// navigation → control → actuators.
+
 // =============================================================================
 // Pin Assignments
 // =============================================================================
@@ -38,31 +41,11 @@
 #define TELNET_PORT      23
 
 // =============================================================================
-// Camera
-// =============================================================================
-#define CAMERA_I2C_ADDR            0x42
-#define CAMERA_UPDATE_INTERVAL_MS    40  // 25 Hz
-#define CAMERA_H_FOV_DEG           66.0f // OV2640 horizontal field of view
-
-// =============================================================================
-// OLED
-// =============================================================================
-#define OLED_WIDTH              128
-#define OLED_HEIGHT              64
-#define OLED_ADDR              0x3C
-#define OLED_UPDATE_INTERVAL_MS 200
-
-// =============================================================================
-// SENSORS
-// =============================================================================
-
-// =============================================================================
 // IMU
 // =============================================================================
 #define IMU_POLLING_INTERVAL_MS  10   // How often IMU is polled
 #define IMU_REPORT_INTERVAL_MS   10   // How often IMU reports data
 // #define IMU_ACCEL_PLOTTER           // Uncomment to stream lax/lay/laz to serial plotter
-
 
 // =============================================================================
 // UWB — Makerfabs DW3000 AOA anchor (Qorvo DW3000, STM32F103C8T6)
@@ -75,25 +58,6 @@
 #define UWB_KALMAN_R          20.0f  // Distance filter measurement noise; stationary test: σ≈4cm → σ²≈14-20 cm²
 #define UWB_OUTLIER_REJECT_CM 30.0f  // Reject single-frame distance jumps larger than this
 #define UWB_OUTLIER_MAX_STREAK    3  // Force-accept after this many consecutive rejections
-
-// =============================================================================
-// Control
-// =============================================================================
-#define THROTTLE_SCALE      0.22f  // Max throttle (0.0–1.0)
-#define THROTTLE_Deadband   0.08f  // Minimum throttle before movement (ESC threshold = 1540µs)
-#define FOLLOW_DISTANCE_CM  200.0f // Distance at which car stops
-#define MAX_DISTANCE_CM     800.0f // Distance at which car runs at max speed
-#define MIN_SPEED_MPH 1.0f  // speed when tag is just past follow distance
-#define MAX_SPEED_MPH 2.5f  // speed when tag is at or beyond max distance
-#define DEFAULT_NAV_MODE       NavMode::FOLLOW_ME
-
-
-// =============================================================================
-// PWM (ESC + Steering Servo)
-// =============================================================================
-#define PWM_NEUTRAL_US 1500
-#define PWM_MIN_US     1000
-#define PWM_MAX_US     2000
 
 // =============================================================================
 // RPM — hall-effect interrupt (speed + odometry) + AS5600 encoder (cogging detection)
@@ -123,17 +87,19 @@
 #define RPM_COGGING_MAX_SPEED_MPH  2.0f   // disable cogging detection above this hall-effect speed
 
 // =============================================================================
-// Throttle PID
+// Camera
 // =============================================================================
-#define CONTROL_UPDATE_INTERVAL_MS  20     // PID update rate (50 Hz)
-#define THROTTLE_SMOOTH_ALPHA       0.05f  // Exponential smoothing on throttle output (0=frozen, 1=no smoothing)
-#define THROTTLE_PID_KP             2.0f
-#define THROTTLE_PID_KI             0.5f
-#define THROTTLE_PID_KD             0.0f
-#define STEERING_MAX                1.0f   // Max steering output (0.0–1.0) — caps servo deflection to prevent brownout
-#define STEERING_PID_KP             0.015f  // ≈ 1/90°: maps ±90° error to ±1.0 steering
-#define STEERING_PID_KI             0.004f
-#define STEERING_PID_KD             0.002f
+#define CAMERA_I2C_ADDR            0x42
+#define CAMERA_UPDATE_INTERVAL_MS    40  // 25 Hz
+#define CAMERA_H_FOV_DEG           66.0f // OV2640 horizontal field of view
+
+// =============================================================================
+// OLED
+// =============================================================================
+#define OLED_WIDTH              128
+#define OLED_HEIGHT              64
+#define OLED_ADDR              0x3C
+#define OLED_UPDATE_INTERVAL_MS 200
 
 // =============================================================================
 // Fusion
@@ -144,6 +110,38 @@
 #define FUSION_INNOV_MEAN_ALPHA   0.4f   // how fast the innovation mean tracks genuine movement; higher = faster tracking, less sensitive to real motion
 #define FUSION_INNOV_EWMA_ALPHA   0.15f  // innovation EWMA decay: higher = faster spike, faster recovery; lower = slower but smoother
 #define FUSION_STALE_UNCERTAINTY 150.0f // uncertainty (deg²) above which nav treats the estimate as stale; steady state ~17, erratic movement ~120
+
+// =============================================================================
+// Navigation — follow behavior
+// =============================================================================
+#define DEFAULT_NAV_MODE    NavMode::FOLLOW_ME
+#define FOLLOW_DISTANCE_CM  200.0f // Distance at which car stops
+#define MAX_DISTANCE_CM     800.0f // Distance at which car runs at max speed
+#define MIN_SPEED_MPH 1.0f  // speed when tag is just past follow distance
+#define MAX_SPEED_MPH 2.5f  // speed when tag is at or beyond max distance
+
+// =============================================================================
+// Control — throttle + steering PIDs
+// =============================================================================
+#define CONTROL_UPDATE_INTERVAL_MS  20     // PID update rate (50 Hz)
+#define THROTTLE_PID_KP             1.7f
+#define THROTTLE_PID_KI             0.5f
+#define THROTTLE_PID_KD             0.0f
+#define STEERING_PID_KP             0.012f  // ≈ 1/90°: maps ±90° error to ±1.0 steering
+#define STEERING_PID_KI             0.006f
+#define STEERING_PID_KD             0.003f
+
+// =============================================================================
+// Actuators — ESC + steering servo output shaping
+// =============================================================================
+#define THROTTLE_SCALE        0.25f  // Max throttle (0.0–1.0)
+#define THROTTLE_Deadband     0.08f  // Minimum throttle before movement (ESC threshold = 1540µs)
+#define THROTTLE_SMOOTH_ALPHA 0.05f  // Exponential smoothing on throttle output (0=frozen, 1=no smoothing)
+#define STEERING_MAX          0.9f   // Max steering output (0.0–1.0) — caps servo deflection to prevent brownout
+#define STEERING_TRIM         -0.05f   // Steering center left offset.
+#define PWM_NEUTRAL_US 1500
+#define PWM_MIN_US     1000
+#define PWM_MAX_US     2000
 
 // =============================================================================
 // Misc

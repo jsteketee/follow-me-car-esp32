@@ -8,3 +8,6 @@ include/secrets.h
 # Claude Code
 CLAUDE.md
 .claude/
+
+# Python bytecode cache
+__pycache__/
