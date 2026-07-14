@@ -1,10 +1,10 @@
 // SSD1306 128x64 OLED display. Renders IMU stats, nav state, throttle/steering values, and a heading arrow.
 #include "oled.h"
-#include "nav.h"
 #include "fusion.h"
 #include "control.h"
 #include "imu.h"
 #include "rpm.h"
+#include "wifi_config.h"
 #include "config.h"
 #include "runtime_config.h"
 #include "utils.h"
@@ -15,21 +15,59 @@
 
 static const char *TAG = "oled";
 
-static Adafruit_SSD1306 _oledDisplay(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+static Adafruit_SSD1306 _oledDisplay(OLED_WIDTH, OLED_HEIGHT, &Wire1, -1);
 static RateGate  _gate{ OLED_UPDATE_INTERVAL_MS };
 static HzTracker _oledHz;
 static uint32_t  _frameCount = 0;
 
+// Snapshot of everything a frame renders, copied on the loop task and consumed by the
+// render task on core 0 — the task never calls the module _get() functions directly,
+// so cross-core reads of live module state can't tear mid-write.
+struct OledSnapshot {
+    float         lps;
+    ControlMode   mode;
+    Pose          fused;
+    ControlOutput output;
+    RPMData       rpm;
+    WifiInfo      wifi;
+    float         remoteHeadingDeg;  // control's held REMOTE target heading — drives the heading arrow
+    float         yawDeg;            // IMU yaw sampled with the same snapshot, for the arrow's error term
+};
+static OledSnapshot _oledSnap;
+static portMUX_TYPE _oledSnapMux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t _oledRenderTask = nullptr;
+
+// Render+push time per frame on core 0. Updated by the render task, read/reset once
+// per window by perf_report on the loop task (guarded by _oledSnapMux).
+static PerfTracker _oledRenderPerf;
+
+// Returns the window's per-frame render+push timing (avg/max µs) and resets it.
+void oled_render_perf(uint32_t& avgUs, uint32_t& maxUs) {
+    taskENTER_CRITICAL(&_oledSnapMux);
+    avgUs = _oledRenderPerf.avg();
+    maxUs = _oledRenderPerf.maxUs;
+    _oledRenderPerf.reset();
+    taskEXIT_CRITICAL(&_oledSnapMux);
+}
+
+static void oled_render_task(void*);
+
 void oled_init() {
-    Wire.setPins(PIN_SDA, PIN_SCL);
+    // Pin Wire1 before _oledDisplay.begin() — its internal wire->begin() takes
+    // default pins if the controller isn't already started.
+    Wire1.begin(PIN_OLED_SDA, PIN_OLED_SCL);
     if (!_oledDisplay.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         Serial.printf("[%s] ❌ OLED not found\n", TAG);
         while (true);
     }
-    Wire.setClock(400000);
+    Wire1.setClock(400000);
     Serial.printf("[%s] ✅ OLED ready\n", TAG);
     _oledDisplay.clearDisplay();
     _oledDisplay.display();
+
+    // Render on core 0 (loop runs on core 1) so the ~25ms blocking I2C framebuffer
+    // push in display() never stalls the control loop.
+    xTaskCreatePinnedToCore(oled_render_task, "oled_render", 4096, nullptr, 1, &_oledRenderTask, 0);
 }
 
 static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long navTimestamp) {
@@ -54,7 +92,7 @@ static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long na
     _oledDisplay.fillTriangle(tx, ty, lx, ly, rx, ry, SSD1306_WHITE);
 }
 
-static void screen_1(float lps, const NavData& nav, const Pose& fused, const ControlOutput& output, const ImuData& imu) {
+static void screen_1(float lps, ControlMode mode, const Pose& fused, const ControlOutput& output, const ImuData& imu) {
     _oledDisplay.setTextColor(SSD1306_WHITE);
     _oledDisplay.setTextSize(1);
 
@@ -86,10 +124,6 @@ static void screen_1(float lps, const NavData& nav, const Pose& fused, const Con
     //     _oledDisplay.println();
     // }
 
-    _oledDisplay.print("NAV:");
-    _oledDisplay.print(nav.updateHz, 2);
-    _oledDisplay.println("hz");
-
     drawHeadingArrow(fused.fusedAngle, fused.distanceCm, fused.timestamp);
 
     if (fused.distanceCm >= 0) {
@@ -102,16 +136,17 @@ static void screen_1(float lps, const NavData& nav, const Pose& fused, const Con
         _oledDisplay.setTextSize(1);
     }
 
-    // last line: nav state, throttle, steering
+    // last line: control state (armed vs stopped), throttle, steering
     _oledDisplay.setCursor(0, 56);
-    _oledDisplay.print(nav.mode == NavMode::FOLLOW_ME ? "OK" : "XX");
+    _oledDisplay.print(mode != ControlMode::STOPPED ? "OK" : "XX");
     _oledDisplay.print(" T:");
     _oledDisplay.print(output.throttle*100, 0);
     _oledDisplay.print(" S:");
     _oledDisplay.print(output.steering*100, 0);
 }
 
-static void screen_2(float lps, const NavData& nav, const Pose& fused, const ControlOutput& output, const RPMData& rpm) {
+static void screen_2(float lps, ControlMode mode, const Pose& fused, const ControlOutput& output, const RPMData& rpm,
+                     float remoteHeadingDeg, float yawDeg) {
     const int barW = 12, barMargin = 2, barSpacing = 4;
     // barFloor: bottom pixel of bars — reserves 8px text row + 1px gap beneath
     const int barFloor = OLED_HEIGHT - 10;
@@ -144,7 +179,19 @@ static void screen_2(float lps, const NavData& nav, const Pose& fused, const Con
     _oledDisplay.drawRect(uncBarX,   0, barW, barFloor + 1, SSD1306_WHITE);
     _oledDisplay.drawRect(tgtBarX,   0, barW, barFloor + 1, SSD1306_WHITE);
 
-    drawHeadingArrow(fused.fusedAngle, fused.distanceCm, fused.timestamp);
+    // Display-local arrow math: in REMOTE the arrow is the heading error
+    // wrap±180(yaw − held target heading) — same quantity and sign convention as
+    // fusedAngle (0 = on target, + = target right of nose). The target comes from
+    // control_remote_heading_deg(), which is boot-seeded, so the arrow works from
+    // power-on (NAN only if the IMU had no yaw at init — drawHeadingArrow hides it).
+    // Other modes keep the fusion tag angle while ESP-side fusion lives.
+    float arrowDeg = fused.fusedAngle;
+    if (mode == ControlMode::REMOTE) {
+        arrowDeg = yawDeg - remoteHeadingDeg;  // NAN target propagates → arrow hidden
+        while (arrowDeg >  180.0f) arrowDeg -= 360.0f;
+        while (arrowDeg < -180.0f) arrowDeg += 360.0f;
+    }
+    drawHeadingArrow(arrowDeg, fused.distanceCm, fused.timestamp);
 
     _oledDisplay.setTextSize(1);
     _oledDisplay.setTextColor(SSD1306_WHITE);
@@ -207,26 +254,85 @@ static void screen_2(float lps, const NavData& nav, const Pose& fused, const Con
         }
     }
 
-    // Nav mode — horizontally centered in the bottom-right box, bottom aligned to the screen edge.
+    // Control mode — horizontally centered in the bottom-right box, bottom aligned to the screen edge.
     const char* modeStr =
-        nav.mode == NavMode::FOLLOW_ME ? "FOLLOW" :
-        nav.mode == NavMode::TEST      ? "TEST"   :
-                                         "STOP";
+        mode == ControlMode::REMOTE ? "REMOTE" :
+        mode == ControlMode::DIRECT ? "DIRECT" :
+                                      "STOP";
     _oledDisplay.setCursor(79 + (OLED_WIDTH - 79 - (int)strlen(modeStr) * 6) / 2, 56);
     _oledDisplay.print(modeStr);
 }
 
+// Boot splash: WiFi connection progress, then SSID + dashboard IP. Shown until
+// OLED_WIFI_SPLASH_MS after the network comes up; returns false once expired.
+static bool screen_wifi_splash(const WifiInfo& wifi) {
+    if (wifi.online && millis() - wifi.onlineSinceMs >= OLED_WIFI_SPLASH_MS) return false;
+
+    _oledDisplay.setTextSize(1);
+    _oledDisplay.setTextColor(SSD1306_WHITE);
+    _oledDisplay.setCursor(0, 0);
+    _oledDisplay.print("Follow Me Car");
+    _oledDisplay.drawFastHLine(0, 10, OLED_WIDTH, SSD1306_WHITE);
+
+    _oledDisplay.setCursor(0, 18);
+    if (!wifi.online) {
+        _oledDisplay.print("WiFi: trying");
+        // Animated trailing dots (~2 Hz) so a hung connection attempt is visibly alive.
+        for (uint32_t i = 0; i <= (millis() / 500) % 3; i++) _oledDisplay.print(".");
+        _oledDisplay.setCursor(0, 30);
+        _oledDisplay.print(wifi.ssid);
+    } else {
+        _oledDisplay.print(wifi.sta ? "WiFi: " : "own AP: ");
+        _oledDisplay.print(wifi.ssid);
+        _oledDisplay.setCursor(0, 36);
+        _oledDisplay.print("Dashboard:");
+        _oledDisplay.setCursor(0, 48);
+        _oledDisplay.print("http://");
+        _oledDisplay.print(wifi.ip);
+    }
+    return true;
+}
+
+// Core-0 render task: waits for a snapshot notification, then draws and pushes the
+// frame. The blocking display() I2C transfer happens here, off the loop task.
+static void oled_render_task(void*) {
+    OledSnapshot snap;
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        taskENTER_CRITICAL(&_oledSnapMux);
+        snap = _oledSnap;
+        taskEXIT_CRITICAL(&_oledSnapMux);
+
+        _oledRenderPerf.begin();
+        _oledDisplay.clearDisplay();
+        if (!screen_wifi_splash(snap.wifi)) {
+            screen_2(snap.lps, snap.mode, snap.fused, snap.output, snap.rpm, snap.remoteHeadingDeg, snap.yawDeg);
+        }
+        _oledDisplay.display();
+        taskENTER_CRITICAL(&_oledSnapMux);
+        _oledRenderPerf.end();
+        taskEXIT_CRITICAL(&_oledSnapMux);
+    }
+}
+
+// Loop-task side: on each 200ms gate tick, snapshot the current module state and
+// wake the render task. Costs microseconds; all drawing/I2C happens on core 0.
 void oled_update(float lps) {
-    const NavData&       nav    = nav_get();
-    const Pose&          fused  = fusion_get();
-    const ControlOutput& output = control_get();
-    const RPMData&       rpm    = rpm_get();
     float dt;
     if (!_gate.tick(dt)) return;
     _oledHz.update();
-
     _frameCount++;
-    _oledDisplay.clearDisplay();
-    screen_2(lps, nav, fused, output, rpm);
-    _oledDisplay.display();
+
+    taskENTER_CRITICAL(&_oledSnapMux);
+    _oledSnap.lps    = lps;
+    _oledSnap.mode   = control_mode();
+    _oledSnap.fused  = fusion_get();
+    _oledSnap.output = control_get();
+    _oledSnap.rpm    = rpm_get();
+    _oledSnap.wifi   = wifi_get();
+    _oledSnap.remoteHeadingDeg = control_remote_heading_deg();
+    _oledSnap.yawDeg           = imu_get().yaw;
+    taskEXIT_CRITICAL(&_oledSnapMux);
+
+    if (_oledRenderTask) xTaskNotifyGive(_oledRenderTask);
 }

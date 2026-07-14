@@ -1,10 +1,9 @@
 // Sensor fusion layer.
-// Tracks the tag's absolute compass bearing, blending UWB AOA angle and camera blob
-// angle via a 1-D Kalman filter on bearing. Converting back to relative angle using imu.yaw
+// Tracks the tag's absolute compass bearing from UWB AOA angle via a 1-D Kalman filter
+// on bearing. Converting back to relative angle using imu.yaw
 // gives automatic rotation compensation without gyro integration or drift.
 #include "fusion.h"
 #include "uwb.h"
-#include "camera.h"
 #include "imu.h"
 #include "rpm.h"
 #include "config.h"
@@ -15,14 +14,13 @@
 
 static const char* TAG = "fusion";
 
-static Pose     _fusedPose          = { .fusedAngle = 0.0f, .uwbAngle = NAN, .camAngle = NAN, .distanceCm = -1.0f, .uwbDistCm = -1.0f };
+static Pose     _fusedPose          = { .fusedAngle = 0.0f, .uwbAngle = NAN, .distanceCm = -1.0f, .uwbDistCm = -1.0f };
 static KalmanFilter  _distKalman;                    // 1-D Kalman filter tracking distance to tag (cm)
 static float         _bearingDeg          = 0.0f;    // Kalman state estimate of absolute bearing to tag
 static float         _bearingP            = 1000.0f; // bearing estimate variance (deg²)
 static float         _innovEwma           = 0.0f;    // EWMA of innov² (deg²) — spikes on surprise, decays on consistent readings
 static uint32_t      _lastUpdateMs        = 0;
 static unsigned long _lastUwbTimestamp    = 0;
-static unsigned long _lastCameraTimestamp = 0;
 static float         _lastOdometryCm      = 0.0f;
 static float         _fusedOdometryCm     = 0.0f;
 static bool          _bearingSeeded       = false;
@@ -61,19 +59,18 @@ void fusion_init() {
     if (!isnan(imu.yaw)) {
         _bearingDeg   = imu.yaw;
         _bearingSeeded = true;
-        Serial.printf("[%s] ✅ fusion ready  bearing seeded from IMU yaw=%.1f°  rUwb=%.1f  rCam=%.1f  stale=%.1f  innovMeanAlpha=%.3f  innovEwmaAlpha=%.3f\n",
-            TAG, imu.yaw, rtConfig.fusionRUwb, rtConfig.fusionRCamera, rtConfig.fusionStaleUncertainty,
+        Serial.printf("[%s] ✅ fusion ready  bearing seeded from IMU yaw=%.1f°  rUwb=%.1f  stale=%.1f  innovMeanAlpha=%.3f  innovEwmaAlpha=%.3f\n",
+            TAG, imu.yaw, rtConfig.fusionRUwb, rtConfig.fusionStaleUncertainty,
             rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha);
     } else {
-        Serial.printf("[%s] ✅ fusion ready  (no IMU yaw — bearing will seed on first update)  rUwb=%.1f  rCam=%.1f\n",
-            TAG, rtConfig.fusionRUwb, rtConfig.fusionRCamera);
+        Serial.printf("[%s] ✅ fusion ready  (no IMU yaw — bearing will seed on first update)  rUwb=%.1f\n",
+            TAG, rtConfig.fusionRUwb);
     }
 }
 
 bool fusion_update() {
     const ImuData&    imu = imu_get();
     const UWBReading& uwb = uwb_get();
-    const CameraData& cam = camera_get();
 
     uint32_t now = millis();
 
@@ -116,19 +113,6 @@ bool fusion_update() {
         }
     }
 
-    // Update bearing from camera readings. The Kalman filter is applied in correct_bearing().
-    bool camUpdated = false;
-    if (cam.timestamp != _lastCameraTimestamp) {
-        _lastCameraTimestamp = cam.timestamp;
-        if (cam.found) {
-            float camAngle = cam.posX * (CAMERA_H_FOV_DEG / 2.0f);
-            _fusedPose.camAngle = camAngle;
-            correct_bearing(camAngle, imu.yaw, rtConfig.fusionRCamera);
-            _fusedPose.timestamp = now;
-            camUpdated = true;
-        }
-    }
-
     // Convert absolute bearing back to relative angle using current compass heading.
     if (!isnan(_bearingDeg)) {
         float relAngle = imu.yaw - _bearingDeg;
@@ -143,15 +127,12 @@ bool fusion_update() {
     _fusedPose.fusedOdometryCm = _fusedOdometryCm;
 
     // Log updates to serial for debugging
-    if (uwbUpdated || camUpdated) {
-        const char* src = (uwbUpdated && camUpdated) ? "📡 uwb + 📷 blob"
-                        : uwbUpdated                 ? "📡 uwb"
-                                                     : "📷 blob";
-        ESP_LOGD(TAG, "bearing=%.1f°  angle=%.1f°  uwbRaw=%.1f°  dist=%.0fcm  rawDist=%.0fcm  unc=%.1f  src=%s",
+    if (uwbUpdated) {
+        ESP_LOGD(TAG, "bearing=%.1f°  angle=%.1f°  uwbRaw=%.1f°  dist=%.0fcm  rawDist=%.0fcm  unc=%.1f  src=📡 uwb",
             _bearingDeg, _fusedPose.fusedAngle, _fusedPose.uwbAngle,
-            _fusedPose.distanceCm, _fusedPose.uwbDistCm, _fusedPose.uncertainty, src);
+            _fusedPose.distanceCm, _fusedPose.uwbDistCm, _fusedPose.uncertainty);
     }
-    return uwbUpdated || camUpdated;
+    return uwbUpdated;
 }
 
 const Pose& fusion_get() { return _fusedPose; }

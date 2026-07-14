@@ -7,24 +7,23 @@
 // Pin Assignments
 // =============================================================================
 
-// I2C
+// I2C — sensor bus (Wire: BNO085 + AS5600)
 #define PIN_SDA               8
 #define PIN_SCL               9
+
+// I2C — OLED bus (Wire1: dedicated controller so the ~25ms frame push never
+// contends with sensor traffic)
+#define PIN_OLED_SDA         17
+#define PIN_OLED_SCL         18
 
 // DW3000 UWB UART
 #define PIN_DW3000_RX         4
 #define PIN_DW3000_TX         5
 
-// Camera I2C (shares Wire bus with OLED/IMU — pull-ups provided by those breakouts)
-#define PIN_CAMERA_SDA        8
-#define PIN_CAMERA_SCL        9
-
-// PWM inputs (via logic shifter)
-#define PIN_PWM_MODE_IN       6
-
 // PWM outputs
 #define PIN_ESC               1
 #define PIN_SERVO             2
+#define PIN_SERVO_UWB         6   // pan servo aiming the UWB anchor (AOA degrades past ~±60°)
 
 // Misc
 #define PIN_BUZZER           12
@@ -35,10 +34,11 @@
 // WiFi
 // =============================================================================
 #include "secrets.h"
-#define WIFI_AP_SSID     "Follow Me"
-#define WIFI_AP_PASS     ""
-#define WIFI_HOSTNAME    "Follow Me"
-#define TELNET_PORT      23
+#define WIFI_AP_SSID        "Follow Me"
+#define WIFI_AP_PASS        ""
+#define WIFI_HOSTNAME       "followme"   // mDNS/DHCP hostname — no spaces (http://followme.local/)
+#define TELNET_PORT         23
+#define WIFI_STA_TIMEOUT_MS 7000   // per-network connect timeout before falling back to the next option
 
 // =============================================================================
 // IMU
@@ -87,42 +87,36 @@
 #define RPM_COGGING_MAX_SPEED_MPH  2.0f   // disable cogging detection above this hall-effect speed
 
 // =============================================================================
-// Camera
-// =============================================================================
-#define CAMERA_I2C_ADDR            0x42
-#define CAMERA_UPDATE_INTERVAL_MS    40  // 25 Hz
-#define CAMERA_H_FOV_DEG           66.0f // OV2640 horizontal field of view
-
-// =============================================================================
 // OLED
 // =============================================================================
 #define OLED_WIDTH              128
 #define OLED_HEIGHT              64
 #define OLED_ADDR              0x3C
 #define OLED_UPDATE_INTERVAL_MS 200
+#define OLED_WIFI_SPLASH_MS   10000  // how long the boot splash holds after WiFi comes up (shows SSID + dashboard IP)
 
 // =============================================================================
 // Fusion
 // =============================================================================
 #define FUSION_SENSOR_TIMEOUT_SEC  3.0f   // seconds without a fix before uncertainty crosses the stale threshold
 #define FUSION_KALMAN_R_UWB      15.0f  // UWB bearing measurement noise (deg²); stationary test: σ≈3-4° → σ²≈10-15
-#define FUSION_KALMAN_R_CAMERA    4.0f  // camera bearing measurement noise (deg²) — lower = trust camera more
 #define FUSION_INNOV_MEAN_ALPHA   0.4f   // how fast the innovation mean tracks genuine movement; higher = faster tracking, less sensitive to real motion
 #define FUSION_INNOV_EWMA_ALPHA   0.15f  // innovation EWMA decay: higher = faster spike, faster recovery; lower = slower but smoother
 #define FUSION_STALE_UNCERTAINTY 150.0f // uncertainty (deg²) above which nav treats the estimate as stale; steady state ~17, erratic movement ~120
 
 // =============================================================================
-// Navigation — follow behavior
+// Follow behavior — tunables the Pi-side follow port will consume (no onboard consumer
+// since FOLLOW_ME was removed; they still feed rtConfig + dashboard sliders)
 // =============================================================================
-#define DEFAULT_NAV_MODE    NavMode::FOLLOW_ME
 #define FOLLOW_DISTANCE_CM  200.0f // Distance at which car stops
 #define MAX_DISTANCE_CM     800.0f // Distance at which car runs at max speed
 #define MIN_SPEED_MPH 1.0f  // speed when tag is just past follow distance
 #define MAX_SPEED_MPH 2.5f  // speed when tag is at or beyond max distance
 
 // =============================================================================
-// Control — throttle + steering PIDs
+// Control — mode + throttle/steering PIDs
 // =============================================================================
+#define DEFAULT_CONTROL_MODE        ControlMode::REMOTE  // mode set at end of setup(); dashboard /mode changes it after that
 #define CONTROL_UPDATE_INTERVAL_MS  20     // PID update rate (50 Hz)
 #define THROTTLE_PID_KP             1.7f
 #define THROTTLE_PID_KI             0.5f
@@ -130,6 +124,7 @@
 #define STEERING_PID_KP             0.012f  // ≈ 1/90°: maps ±90° error to ±1.0 steering
 #define STEERING_PID_KI             0.006f
 #define STEERING_PID_KD             0.003f
+#define CMD_TIMEOUT_MS              300    // REMOTE failsafe: ms without a valid serial command frame before neutral throttle (steering stays on, holding the last heading)
 
 // =============================================================================
 // Actuators — ESC + steering servo output shaping
@@ -138,10 +133,23 @@
 #define THROTTLE_Deadband     0.08f  // Minimum throttle before movement (ESC threshold = 1540µs)
 #define THROTTLE_SMOOTH_ALPHA 0.05f  // Exponential smoothing on throttle output (0=frozen, 1=no smoothing)
 #define STEERING_MAX          0.9f   // Max steering output (0.0–1.0) — caps servo deflection to prevent brownout
-#define STEERING_TRIM         -0.05f   // Steering center left offset.
+#define STEERING_TRIM         0.0f   // Steering center left offset.
 #define PWM_NEUTRAL_US 1500
 #define PWM_MIN_US     1000
 #define PWM_MAX_US     2000
+
+// =============================================================================
+// Pan servo — aims the UWB anchor at the tag (AOA quality degrades past ~±60°).
+// The ESP32 only maps µs↔degrees and reports the angle; the Pi's tf tree does
+// the frame correction. Calibrate the map with the pan-cal env (see pan.cpp).
+// =============================================================================
+#define PAN_SERVO_MIN_US         800   // travel endpoint, sweep-verified 2026-07-14
+#define PAN_SERVO_MAX_US        2200   // travel endpoint, sweep-verified 2026-07-14
+#define PAN_SERVO_CENTER_US     1500   // nominal pulse width for anchor boresight = car forward
+#define PAN_SERVO_TRIM_US         28   // mechanical centering offset (µs), added to center — re-derive with a post-±30%-span cal run (last fit's trim was bent by nonlinear edge points)
+#define PAN_SERVO_US_PER_DEG  -10.52f  // signed: pan deg (+right) = (us - center - trim) / this — pan-cal 2026-07-14 (two runs agree ~10.5–11.7 after remount)
+#define PAN_SLEW_DEG_PER_S     50.0f   // max pan slew rate — µs step per 20ms tick derived from PAN_SERVO_US_PER_DEG, so this stays true across recalibrations
+#define PAN_MAX_DEG            55.0f   // symmetric target clamp: one limit both sides for the Pi's benefit, ≤ the shorter side's physical travel at any plausible trim
 
 // =============================================================================
 // Misc

@@ -106,9 +106,10 @@ struct HzTracker {
     uint32_t lastSecond = 0;
     float hz = 0.0f;
 
-    // Call once per event. hz refreshes 10 times per second
-    void update(bool valid = true) {
-        if (valid) count++;
+    // Call once per poll with the number of new events observed (a bool works for
+    // the common 0/1 case). hz refreshes 10 times per second
+    void update(uint32_t events = 1) {
+        count += events;
         uint32_t now = millis();
         if (now - lastSecond >= 100) {
             hz = count * 1000.0f / (now - lastSecond);

@@ -20,9 +20,7 @@ RuntimeConfig rtConfig = {
     .uwbOutlierRejectCm     = UWB_OUTLIER_REJECT_CM,
     .sensorTimeoutSec       = FUSION_SENSOR_TIMEOUT_SEC,
     .fusionRUwb             = FUSION_KALMAN_R_UWB,
-    .fusionRCamera          = FUSION_KALMAN_R_CAMERA,
     .fusionStaleUncertainty = FUSION_STALE_UNCERTAINTY,
     .fusionInnovMeanAlpha   = FUSION_INNOV_MEAN_ALPHA,
     .fusionInnovEwmaAlpha   = FUSION_INNOV_EWMA_ALPHA,
-    .testThrottle           = 0.0f,
 };

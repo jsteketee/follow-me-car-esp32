@@ -27,12 +27,9 @@ struct RuntimeConfig {
     // Fusion
     float sensorTimeoutSec;
     float fusionRUwb;
-    float fusionRCamera;
     float fusionStaleUncertainty;
     float fusionInnovMeanAlpha;
     float fusionInnovEwmaAlpha;
-    // Throttle test
-    float testThrottle;
 };
 
 extern RuntimeConfig rtConfig;

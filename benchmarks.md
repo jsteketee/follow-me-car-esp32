@@ -172,3 +172,75 @@ CONTROL_UPDATE_INTERVAL_MS = 20
 **Notes:** UWB exec avg drops from 8µs (timeout path) to 5µs when anchors are responding — timeout path is slightly more expensive due to repeated millis() checks. OLED remains the primary bottleneck (25ms I2C transfer). UWB ranging cycle is ~200ms (50ms poll interval + sequential left→right polling each taking up to ~100ms). IMU jitter is comparable to Benchmark #1 — OLED I2C contention still dominant.
 
 ---
+
+## Benchmark #3 — 2026-07-13
+
+**Note:** OLED decoupled from the loop — rendering + frame push moved to a dedicated
+FreeRTOS task on core 0, and the panel moved to its own I2C controller (Wire1,
+GPIO 17/18) so the ~26ms frame transfer no longer contends with sensor traffic on
+the shared bus. Loop-side `oled_update()` is now just a snapshot+notify handoff.
+Report format extended since #2: `lps` is a true window average (was a 100ms-slice
+sample — earlier lps values are not directly comparable), plus new `maxLoop`
+(longest gap between loop entries), `oledT` (core-0 render+push), `fus`, `rpm`,
+`dash`, and `ser` columns. UWB is now the DW3000 AOA anchor on UART (no more
+poll/stagger timing config).
+
+**Loop config:**
+```
+perfImu.begin();    imu_update();                 perfImu.end();     // ACTIVE
+perfUwb.begin();    uwb_update();                 perfUwb.end();     // ACTIVE
+perfFusion.begin(); fusion_update();              perfFusion.end();  // ACTIVE
+perfNav.begin();    nav_update();                 perfNav.end();     // ACTIVE
+perfCtrl.begin();   control_update();             perfCtrl.end();    // ACTIVE
+perfOled.begin();   oled_update(loopHz.hz);       perfOled.end();    // ACTIVE (snapshot+notify; render on core 0)
+perfWifi.begin();   wifi_update();                perfWifi.end();    // ACTIVE
+perfRpm.begin();    rpm_update();                 perfRpm.end();     // ACTIVE
+perfDash.begin();   dashboard_update(loopHz.hz);  perfDash.end();    // ACTIVE
+perfSerial.begin(); serial_hal_update();          perfSerial.end();  // ACTIVE
+```
+
+**Timing config:**
+```
+IMU_POLLING_INTERVAL_MS      = 10
+IMU_REPORT_INTERVAL_MS       = 10
+RPM_POLL_INTERVAL_MS         = 5
+OLED_UPDATE_INTERVAL_MS      = 200
+CONTROL_UPDATE_INTERVAL_MS   = 20
+DASHBOARD_UPDATE_INTERVAL_MS = 100
+DW3000_BAUD                  = 115200 (UART; ~50Hz ranging)
+```
+
+**UWB state:** DW3000 anchor live, tag present — ~50Hz ranging (sensor line reads
+30–50Hz due to 100ms HzTracker slice quantization)
+
+**Averaged results** _(computed from 13 perf report samples; first 2 skipped)_**:**
+
+| Metric | Avg | Max (avg of maxes) |
+|--------|-----|--------------------|
+| Loop rate (lps) | 3971 | — |
+| Max loop gap (µs) | — | 4,765 |
+| IMU exec (µs) | 70 | 3,913 |
+| UWB exec (µs) | 15 | 668 |
+| Fusion exec (µs) | 6 | 65 |
+| Nav exec (µs) | 2 | 30 |
+| Ctrl exec (µs) | 59 | 195 |
+| OLED handoff (µs) | 2 | 24 |
+| OLED render task, core 0 (µs) | 26,539 | 26,842 |
+| WiFi exec (µs) | 51 | 202 |
+| RPM exec (µs) | 21 | 440 |
+| Dashboard exec (µs) | 6 | 987 |
+| Serial HAL exec (µs) | 3 | 28 |
+
+**Sensor rates:** imu=100Hz, uwb=~50Hz, rpm=200Hz — all at target.
+
+**Notes:** Worst-case loop stall dropped from ~48ms (shared-bus era: 25ms OLED frame
+starving the Wire lock + ~20ms IMU event-backlog drain) to ~4.8ms, which is now just
+the IMU's own active SHTP poll — `maxLoop ≈ imu max` confirms nothing else blocks.
+The 50Hz control tick can no longer miss its window. OLED render still costs ~26.5ms
+per frame but is paid entirely on core 0/Wire1 where nothing waits on it. Intermediate
+experiment (chunked frame push with 1ms yields on the shared bus) made things worse —
+fine-grained bus interleaving multiplied the BNO085's multi-transaction event reads to
+~160ms stalls; dedicated bus was the correct fix. UWB coming online (0→50Hz) added no
+measurable loop cost (fus/nav maxes up ~50µs).
+
+---

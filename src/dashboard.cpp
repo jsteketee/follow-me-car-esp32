@@ -1,10 +1,8 @@
 // HTTP + WebSocket dashboard. Serves a single-page UI at port 80 and pushes
 // telemetry JSON at ~10 Hz. Config overrides are applied via POST /config.
 #include "dashboard.h"
-#include "nav.h"
 #include "fusion.h"
 #include "uwb.h"
-#include "camera.h"
 #include "rpm.h"
 #include "imu.h"
 #include "control.h"
@@ -58,7 +56,6 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
 <h1><span><span id="dot"></span>Follow-Me Car</span><span id="connStatus">Disconnected</span></h1>
 <div style="display:flex;gap:8px;margin-bottom:10px">
   <span class="pill" id="pill-uwb">UWB</span>
-  <span class="pill" id="pill-cam">CAM</span>
   <span class="pill" id="pill-fix">FIX</span>
 </div>
 <div class="row">
@@ -100,19 +97,9 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   <div class="card" style="flex:0 0 auto">
     <h2>Drive Mode</h2>
     <div style="display:flex;gap:8px">
-      <button class="btn" id="btn-FOLLOW_ME"    onclick="setMode('FOLLOW_ME')">Follow Me</button>
-      <button class="btn" id="btn-TEST"         onclick="setMode('TEST')">Test</button>
-      <button class="btn" id="btn-THROTTLE_TEST" onclick="setMode('THROTTLE_TEST')">Throttle Test</button>
+      <button class="btn" id="btn-REMOTE"       onclick="setMode('REMOTE')">Remote</button>
+      <button class="btn" id="btn-DIRECT"       onclick="setMode('DIRECT')">Direct</button>
       <button class="btn" id="btn-STOPPED"      onclick="setMode('STOPPED')">Stopped</button>
-    </div>
-  </div>
-</div>
-<div class="row" id="throttleTestCard" style="display:none">
-  <div class="card">
-    <h2>Throttle Test Control</h2>
-    <div class="srow">
-      <label><span>Throttle — direct output (0 = neutral, 1 = full forward)</span><span id="v_tTh">0.00</span></label>
-      <input type="range" id="testThrottle" min="0.0" max="1.0" step="0.01" value="0">
     </div>
   </div>
 </div>
@@ -201,10 +188,6 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
       <input type="range" id="fusionRUwb" min="25.0" max="200.0" step="5.0">
     </div>
     <div class="srow">
-      <label><span>Bearing R (Cam) — lower = trust each camera fix more</span><span id="v_fRc">--</span></label>
-      <input type="range" id="fusionRCamera" min="1.0" max="8.0" step="0.5">
-    </div>
-    <div class="srow">
       <label><span>Stale Threshold — freeze steering/throttle above</span><span id="v_fSU">--</span></label>
       <input type="range" id="fusionStaleUncertainty" min="50.0" max="400.0" step="10.0">
     </div>
@@ -252,18 +235,17 @@ const seriesVisible = { speed: true, target: true, throttle: true };
 const legendBounds  = [];
 
 function render(d) {
-  const valid = d.navState === 'FOLLOW_ME';
-  ['FOLLOW_ME','TEST','THROTTLE_TEST','STOPPED'].forEach(m => {
+  const valid = d.fixQ < 2;  // fusion fix quality drives staleness styling of the fusion-fed readouts
+  ['REMOTE','DIRECT','STOPPED'].forEach(m => {
     const b = document.getElementById('btn-' + m);
     if (b) b.className = 'btn' + (d.navState === m ? ' active' : '');
   });
-  document.getElementById('throttleTestCard').style.display = d.navState === 'THROTTLE_TEST' ? '' : 'none';
   set('dist',     d.dist.toFixed(0) + ' cm');
   set('angle',    d.angle.toFixed(1) + '°');
   set('navState', d.navState);
   cls('dist',     valid ? 'val' : 'stale');
   cls('angle',    valid ? 'val' : 'stale');
-  cls('navState', valid ? 'val' : 'stale');
+  cls('navState', 'val');
   set('odometry', (d.odometry / 100).toFixed(1) + ' m');
   set('speed',    d.speed.toFixed(2) + ' mph');
   set('rpm',      d.rpm.toFixed(0));
@@ -292,11 +274,9 @@ function render(d) {
     slide('uwbOutlierRejectCm',  d.cfg.uOr, 'v_uOr',  v => v.toFixed(0) + ' cm');
     slide('sensorTimeoutSec',    d.cfg.fT,  'v_fT',   v => v.toFixed(1) + ' s');
     slide('fusionRUwb',          d.cfg.fR,  'v_fR',   v => v.toFixed(0));
-    slide('fusionRCamera',       d.cfg.fRc, 'v_fRc',  v => v.toFixed(0));
     slide('fusionStaleUncertainty',d.cfg.fSU,'v_fSU', v => v.toFixed(0));
     slide('fusionInnovMeanAlpha', d.cfg.fMa, 'v_fMa',  v => v.toFixed(2));
     slide('fusionInnovEwmaAlpha',d.cfg.fEa, 'v_fEa',  v => v.toFixed(3));
-    slide('testThrottle',        d.cfg.tTh, 'v_tTh',  v => v.toFixed(2));
     _maxSpeedMph = d.cfg.mxSp;
   }
   speedBuf.push(d.speed);
@@ -306,22 +286,15 @@ function render(d) {
   throttleBuf.push(d.throttle);
   throttleBuf.shift();
   drawSpeedGraph();
-  let thirdDeg, thirdLabel;
-  if (d.navState === 'FOLLOW_ME') {
-    thirdDeg   = valid ? d.angle : 0;
-    thirdLabel = 'Target';
-  } else {
-    let err = d.headingHold - d.heading;
-    while (err >  180) err -= 360;
-    while (err < -180) err += 360;
-    thirdDeg   = -err;
-    thirdLabel = 'Target';
-  }
-  drawArrow(thirdDeg, -d.steering * 90, valid, d.navState !== 'STOPPED', thirdLabel);
+  // Target arrow: heading error against control's held REMOTE target (same value the
+  // steering PID chases; wrap matches the firmware's ±180 convention).
+  let err = d.heading - d.remoteHeading;
+  while (err >  180) err -= 360;
+  while (err < -180) err += 360;
+  drawArrow(err, -d.steering * 90, valid, d.navState === 'REMOTE', 'Target');
   drawPosView(d.dist, d.angle, d.uwbQ < 2 ? d.uwbAngle : null, d.uwbDist || -1, d.cfg ? d.cfg.fd : 170, d.fixQ);
   if (d.perf) { _perfData = d.perf; drawPerfGraph(); }
   setPill('pill-uwb', d.uwbQ);
-  setPill('pill-cam', d.camQ);
   setPill('pill-fix', d.fixQ);
 }
 
@@ -338,8 +311,7 @@ function setMode(m) {
 ['throttleScale','minSpeedMph','maxSpeedMph','followDistanceCm','maxDistanceCm','kp','ki',
  'steeringTrim','steeringKp','steeringKi','steeringMax',
  'uwbKalmanQ','uwbKalmanR','uwbOutlierRejectCm',
- 'sensorTimeoutSec','fusionRUwb','fusionRCamera','fusionStaleUncertainty','fusionInnovMeanAlpha','fusionInnovEwmaAlpha',
- 'testThrottle'].forEach(id => {
+ 'sensorTimeoutSec','fusionRUwb','fusionStaleUncertainty','fusionInnovMeanAlpha','fusionInnovEwmaAlpha'].forEach(id => {
   document.getElementById(id).addEventListener('change', () => {
     fetch('/config?key=' + id + '&value=' + document.getElementById(id).value, {method:'POST'});
   });
@@ -604,8 +576,8 @@ function setPerfMode(m) {
 }
 const perfCanvas = document.getElementById('perfGraph');
 const pctx = perfCanvas.getContext('2d');
-const PERF_LABELS  = ['IMU','UWB','Nav','Ctrl','OLED','WiFi'];
-const PERF_COLORS  = ['#4f4','#4af','#fa4','#f66','#a4f','#4fa'];
+const PERF_LABELS  = ['IMU','UWB','Ctrl','OLED','WiFi'];
+const PERF_COLORS  = ['#4f4','#4af','#f66','#a4f','#4fa'];
 function drawPerfGraph() {
   if (!_perfData) return;
   const w = perfCanvas.offsetWidth || 400;
@@ -614,8 +586,8 @@ function drawPerfGraph() {
   const pad = 4, labelH = 16, valH = 12;
   pctx.clearRect(0, 0, w, h);
   const vals = _perfMode === 'avg'
-    ? [_perfData.ia, _perfData.ua, _perfData.na, _perfData.ca, _perfData.oa, _perfData.wa]
-    : [_perfData.im, _perfData.um, _perfData.nm, _perfData.cm, _perfData.om, _perfData.wm];
+    ? [_perfData.ia, _perfData.ua, _perfData.ca, _perfData.oa, _perfData.wa]
+    : [_perfData.im, _perfData.um, _perfData.cm, _perfData.om, _perfData.wm];
   const maxVal = Math.max(1, ...vals);
   const n = vals.length;
   const barW = (w - pad * 2) / n;
@@ -669,11 +641,9 @@ void dashboard_init() {
             else if (key == "uwbOutlierRejectCm")     rtConfig.uwbOutlierRejectCm     = val;
             else if (key == "sensorTimeoutSec")       rtConfig.sensorTimeoutSec       = val;
             else if (key == "fusionRUwb")             rtConfig.fusionRUwb             = val;
-            else if (key == "fusionRCamera")          rtConfig.fusionRCamera          = val;
             else if (key == "fusionStaleUncertainty") rtConfig.fusionStaleUncertainty = val;
             else if (key == "fusionInnovMeanAlpha")   rtConfig.fusionInnovMeanAlpha   = val;
             else if (key == "fusionInnovEwmaAlpha")   rtConfig.fusionInnovEwmaAlpha   = val;
-            else if (key == "testThrottle")           rtConfig.testThrottle           = val;
             ESP_LOGI(TAG, "config %s = %.3f", key.c_str(), val);
         }
         req->send(200);
@@ -682,10 +652,9 @@ void dashboard_init() {
     _server.on("/mode", HTTP_POST, [](AsyncWebServerRequest* req) {
         if (req->hasParam("mode")) {
             String m = req->getParam("mode")->value();
-            if      (m == "FOLLOW_ME")    nav_set_mode(NavMode::FOLLOW_ME);
-            else if (m == "TEST")         nav_set_mode(NavMode::TEST);
-            else if (m == "THROTTLE_TEST") nav_set_mode(NavMode::THROTTLE_TEST);
-            else if (m == "STOPPED")      nav_set_mode(NavMode::STOPPED);
+            if      (m == "REMOTE")  control_set_mode(ControlMode::REMOTE);
+            else if (m == "DIRECT")  control_set_mode(ControlMode::DIRECT);
+            else if (m == "STOPPED") control_set_mode(ControlMode::STOPPED);
             ESP_LOGI(TAG, "mode → %s", m.c_str());
         }
         req->send(200);
@@ -706,19 +675,16 @@ static RateGate _gate{ DASHBOARD_UPDATE_INTERVAL_MS };
 void dashboard_set_perf(const PerfData& p) { _perf = p; }
 
 void dashboard_update(float lps) {
-    const NavData&       nav   = nav_get();
+    const ControlMode    mode  = control_mode();
     const Pose&          fused = fusion_get();
     const UWBReading&    uwb   = uwb_get();
-    const CameraData&    cam   = camera_get();
     const RPMData&       rpm   = rpm_get();
     const ImuData&       imu   = imu_get();
     const ControlOutput& ctrl  = control_get();
 
     uint32_t nowMs   = millis();
     uint32_t uwbAge  = nowMs - uwb.timestamp;
-    uint32_t camAge  = nowMs - cam.timestamp;
     int uwbQ = uwbAge < 500 ? 0 : uwbAge < 1500 ? 1 : 2;
-    int camQ = (cam.found && camAge < 200) ? 0 : camAge < 500 ? 1 : 2;
     int fixQ = fused.uncertainty < rtConfig.fusionStaleUncertainty * 0.5f ? 0 :
                fused.uncertainty < rtConfig.fusionStaleUncertainty        ? 1 : 2;
     float dt;
@@ -728,8 +694,8 @@ void dashboard_update(float lps) {
 
     char buf[1350];
     snprintf(buf, sizeof(buf),
-        "{\"dist\":%.1f,\"angle\":%.1f,\"uwbAngle\":%.1f,\"uwbDist\":%.1f,\"headingHold\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
-        "\"uwbQ\":%d,\"camQ\":%d,\"fixQ\":%d,"
+        "{\"dist\":%.1f,\"angle\":%.1f,\"uwbAngle\":%.1f,\"uwbDist\":%.1f,\"remoteHeading\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
+        "\"uwbQ\":%d,\"fixQ\":%d,"
         "\"speed\":%.3f,\"rpm\":%.0f,\"cogging\":%d,\"signChanges\":%d,"
         "\"heading\":%.1f,\"cal_rot\":%u,\"cal_acc\":%u,"
         "\"throttle\":%.3f,\"steering\":%.3f,\"tSp\":%.3f,\"lps\":%.0f,"
@@ -737,17 +703,15 @@ void dashboard_update(float lps) {
         "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,"
         "\"sTr\":%.3f,\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
         "\"uQ\":%.2f,\"uR\":%.2f,\"uOr\":%.1f,"
-        "\"fT\":%.2f,\"fR\":%.1f,\"fRc\":%.1f,\"fSU\":%.1f,\"fMa\":%.3f,\"fEa\":%.4f,"
-        "\"tTh\":%.3f},"
-        "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,\"na\":%u,\"nm\":%u,"
+        "\"fT\":%.2f,\"fR\":%.1f,\"fSU\":%.1f,\"fMa\":%.3f,\"fEa\":%.4f},"
+        "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,"
         "\"ca\":%u,\"cm\":%u,\"oa\":%u,\"om\":%u,\"wa\":%u,\"wm\":%u}}",
-        safeF(fused.distanceCm), safeF(fused.fusedAngle), safeF(fused.uwbAngle), safeF(fused.uwbDistCm), safeF(nav.headingHold),
-        nav.mode == NavMode::FOLLOW_ME    ? "FOLLOW_ME"    :
-        nav.mode == NavMode::TEST         ? "TEST"         :
-        nav.mode == NavMode::THROTTLE_TEST ? "THROTTLE_TEST" :
-        nav.mode == NavMode::STOPPED      ? "STOPPED"      : "UNKNOWN",
+        safeF(fused.distanceCm), safeF(fused.fusedAngle), safeF(fused.uwbAngle), safeF(fused.uwbDistCm), safeF(control_remote_heading_deg()),
+        mode == ControlMode::REMOTE  ? "REMOTE"  :
+        mode == ControlMode::DIRECT  ? "DIRECT"  :
+        mode == ControlMode::STOPPED ? "STOPPED" : "UNKNOWN",
         safeF(rpm.odometryCm),
-        uwbQ, camQ, fixQ,
+        uwbQ, fixQ,
         safeF(rpm.speedMph), safeF(rpm.rpm), (int)rpm.cogging, rpm.signChanges,
         safeF(imu.yaw), imu.cal_rot, imu.cal_accel,
         safeF(ctrl.throttle), safeF(ctrl.steering), safeF(ctrl.targetSpeedMph), safeF(lps),
@@ -757,12 +721,10 @@ void dashboard_update(float lps) {
         rtConfig.kp, rtConfig.ki, rtConfig.kd,
         rtConfig.steeringTrim, rtConfig.steeringKp, rtConfig.steeringKi, rtConfig.steeringMax,
         rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR, rtConfig.uwbOutlierRejectCm,
-        rtConfig.sensorTimeoutSec, rtConfig.fusionRUwb, rtConfig.fusionRCamera,
+        rtConfig.sensorTimeoutSec, rtConfig.fusionRUwb,
         rtConfig.fusionStaleUncertainty, rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha,
-        rtConfig.testThrottle,
         _perf.imuAvg,  _perf.imuMax,
         _perf.uwbAvg,  _perf.uwbMax,
-        _perf.navAvg,  _perf.navMax,
         _perf.ctrlAvg, _perf.ctrlMax,
         _perf.oledAvg, _perf.oledMax,
         _perf.wifiAvg, _perf.wifiMax);

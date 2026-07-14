@@ -20,6 +20,7 @@ static volatile bool     _hallPulseValid  = false;
 static float             _hallEmaSpeed    = 0.0f;
 static int               _hallSpikeStreak = 0;
 static uint32_t          _hallLastCountTracked = 0; // pulse count snapshot for odometry
+static HzTracker         _hallHz;                   // pulse arrival rate — 0 at standstill, scales with wheel speed
 
 // ISR — records inter-pulse period and increments pulse counter.
 static void IRAM_ATTR on_hall_pulse() {
@@ -152,7 +153,8 @@ static bool analyze_cogging(int& outSignChanges, int& outNetDelta) {
 }
 
 // Polls the encoder, pushes the latest delta into the cogging buffer, and updates the cogging flag.
-// Returns true when the poll gate fired (used by rpm_update to report update rate).
+// Returns true only when a new valid angle was read — failed reads and skipped gates
+// return false, so callers measuring the rate see actual data arrival, not poll attempts.
 static bool update_encoder() {
     float unused;
     if (!_encPollGate.tick(unused)) return false;
@@ -160,7 +162,7 @@ static bool update_encoder() {
     int angle = read_encoder_angle();
     if (angle < 0) {
         ESP_LOGW(TAG, "⚠️ AS5600 read failed");
-        return true;
+        return false;
     }
 
     if (_encLastAngle < 0) {
@@ -252,6 +254,11 @@ static void update_hall() {
     // Odometry: count new pulses since last call; skip accumulation during cogging.
     uint32_t newPulses    = pulseCount - _hallLastCountTracked;
     _hallLastCountTracked = pulseCount;
+
+    // Pulse arrival rate — updated before the early returns below so the rate
+    // decays to 0 at standstill instead of freezing at its last value.
+    _hallHz.update(newPulses);
+    _rpmData.hallHz = _hallHz.hz;
     if (!_rpmData.cogging)
         _rpmData.odometryCm += (float)newPulses * RPM_HALL_CM_PER_PULSE;
     _rpmData.timestamp = millis();
@@ -303,7 +310,7 @@ void rpm_init() {
     attachInterrupt(digitalPinToInterrupt(PIN_RPM), on_hall_pulse, FALLING);
     Serial.printf("[%s] ✅ hall-effect sensor ready on pin %d\n", TAG, PIN_RPM);
 
-    // Encoder: Wire already open from oled_init(); just probe the device.
+    // Encoder: Wire already open from setup(); just probe the device.
     Wire.beginTransmission(AS5600_ADDR);
     if (Wire.endTransmission() != 0) {
         Serial.printf("[%s] ❌ AS5600 not found at 0x%02X — check wiring\n", TAG, AS5600_ADDR);
@@ -313,7 +320,8 @@ void rpm_init() {
     }
 }
 
-// Updates hall-effect speed/odometry and encoder cogging detection; returns true when the encoder gate fires.
+// Updates hall-effect speed/odometry and encoder cogging detection; returns true when
+// a new valid encoder angle was read this call.
 bool rpm_update() {
     bool encTick = update_encoder();
     update_hall();
