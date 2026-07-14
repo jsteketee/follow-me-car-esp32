@@ -24,6 +24,11 @@ static RateGate _gate{20};  // 50 Hz
 // each shape arrives.
 static CommandData _cmdData = { 0.0f, 0.0f, 0, 0.0f, 0.0f, 0, 0.0f };
 
+// Command values rejected by validation since boot — echoed in telemetry as
+// cmd_rejects so the Pi can distinguish frames-arriving-but-invalid (counter ticking)
+// from frames not arriving at all (cmd_age climbing, counter flat).
+static uint32_t _cmdRejects = 0;
+
 // RX line assembly buffer. Frames are newline-delimited; anything that doesn't parse
 // and validate as a command frame is silently dropped (logs, garbage, torn lines).
 static char   _rxBuf[128];
@@ -64,9 +69,9 @@ static bool process_setpoint_frame(const char* line) {
     // Validation: a NaN reaching the actuator smoothing EMA poisons it permanently
     // (see actuators.cpp float_to_pwm path), so non-finite or out-of-range values
     // reject the entire frame — lastCmdMs is NOT stamped.
-    if (!isfinite(speed) || !isfinite(heading))            { log_cmd("setpoint", "REJECT (non-finite)", speed, heading); return true; }
-    if (speed < 0.0f || speed > rtConfig.maxSpeedMph)      { log_cmd("setpoint", "REJECT (speed range)", speed, heading); return true; }  // no reverse
-    if (heading < -360.0f || heading > 720.0f)             { log_cmd("setpoint", "REJECT (heading range)", speed, heading); return true; }
+    if (!isfinite(speed) || !isfinite(heading))            { _cmdRejects++; log_cmd("setpoint", "REJECT (non-finite)", speed, heading); return true; }
+    if (speed < 0.0f || speed > rtConfig.maxSpeedMph)      { _cmdRejects++; log_cmd("setpoint", "REJECT (speed range)", speed, heading); return true; }  // no reverse
+    if (heading < -360.0f || heading > 720.0f)             { _cmdRejects++; log_cmd("setpoint", "REJECT (heading range)", speed, heading); return true; }
 
     // Normalize heading to [0, 360) — same convention as the telemetry yaw field.
     while (heading >= 360.0f) heading -= 360.0f;
@@ -87,9 +92,9 @@ static bool process_direct_frame(const char* line) {
     if (!json_get_float(line, "\"throttle\":", &throttle)) return false;
     if (!json_get_float(line, "\"steering\":", &steering)) return false;
 
-    if (!isfinite(throttle) || !isfinite(steering)) { log_cmd("direct", "REJECT (non-finite)", throttle, steering); return true; }
-    if (throttle < 0.0f || throttle > 1.0f)         { log_cmd("direct", "REJECT (throttle range)", throttle, steering); return true; }  // no reverse
-    if (steering < -1.0f || steering > 1.0f)        { log_cmd("direct", "REJECT (steering range)", throttle, steering); return true; }
+    if (!isfinite(throttle) || !isfinite(steering)) { _cmdRejects++; log_cmd("direct", "REJECT (non-finite)", throttle, steering); return true; }
+    if (throttle < 0.0f || throttle > 1.0f)         { _cmdRejects++; log_cmd("direct", "REJECT (throttle range)", throttle, steering); return true; }  // no reverse
+    if (steering < -1.0f || steering > 1.0f)        { _cmdRejects++; log_cmd("direct", "REJECT (steering range)", throttle, steering); return true; }
 
     _cmdData.directThrottle = throttle;
     _cmdData.directSteering = steering;
@@ -105,11 +110,13 @@ static bool process_direct_frame(const char* line) {
 static void process_command_line(const char* line) {
     // Optional pan command, honored in any frame shape: aim the UWB anchor (deg,
     // 0 = car nose, +right). An absent field keeps the previous target; an invalid
-    // value is ignored without affecting the rest of the frame. Routed to the pan
-    // module by main's loop.
+    // value is counted as a reject without affecting the rest of the frame. Routed
+    // to the pan module by main's loop.
     float pan;
-    if (json_get_float(line, "\"target_pan\":", &pan) && isfinite(pan) && fabsf(pan) <= 90.0f)
-        _cmdData.targetPanDeg = pan;
+    if (json_get_float(line, "\"target_pan\":", &pan)) {
+        if (isfinite(pan) && fabsf(pan) <= 90.0f) _cmdData.targetPanDeg = pan;
+        else                                      _cmdRejects++;
+    }
 
     if (!process_setpoint_frame(line)) process_direct_frame(line);
 }
@@ -170,7 +177,7 @@ void serial_hal_update() {
         ",\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,\"lax\":%.3f"
         ",\"speed\":%.3f,\"odo\":%.1f,\"enc_speed\":%.3f,\"cogging\":%d"
         ",\"fused_angle\":%.2f,\"fused_dist\":%.1f,\"fused_unc\":%.2f"
-        ",\"cmd_speed\":%.2f,\"cmd_heading\":%.1f,\"cmd_pan\":%.1f,\"cmd_age\":%ld"
+        ",\"cmd_speed\":%.2f,\"cmd_heading\":%.1f,\"cmd_pan\":%.1f,\"cmd_age\":%ld,\"cmd_rejects\":%lu"
         ",\"throttle\":%.3f,\"steering\":%.3f"
         ",\"pan_angle\":%.2f"
         "}\n",
@@ -179,7 +186,7 @@ void serial_hal_update() {
         imu.yaw, imu.pitch, imu.roll, imu.lax,
         rpm.speedMph, rpm.odometryCm, rpm.encSpeedMph, (int)rpm.cogging,
         pose.fusedAngle, pose.distanceCm, pose.uncertainty,
-        _cmdData.targetSpeedMph, _cmdData.targetHeadingDeg, _cmdData.targetPanDeg, cmdAge,
+        _cmdData.targetSpeedMph, _cmdData.targetHeadingDeg, _cmdData.targetPanDeg, cmdAge, (unsigned long)_cmdRejects,
         ctrl.throttle, ctrl.steering,
         pan_get_angle());
 }
