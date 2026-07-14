@@ -11,3 +11,6 @@ CLAUDE.md
 
 # Python bytecode cache
 __pycache__/
+
+# Local reference material (datasheets, images, etc.)
+Project Resources/
