@@ -1,12 +1,15 @@
 // HTTP + WebSocket dashboard. Serves a single-page UI at port 80 and pushes
-// telemetry JSON at ~10 Hz. Config overrides are applied via POST /config.
+// telemetry JSON at ~10 Hz. Config overrides are applied via POST /config, mode via
+// POST /mode, and the bench test sliders over the WebSocket ("direct:<t>,<s>,<p>"
+// and "setpoint:<mph>" text frames; POST /direct and /setpoint as fallbacks).
 #include "dashboard.h"
-#include "fusion.h"
 #include "uwb.h"
 #include "rpm.h"
 #include "imu.h"
 #include "control.h"
+#include "serial_hal.h"
 #include "runtime_config.h"
+#include "config.h"
 #include "utils.h"
 #include <ESPAsyncWebServer.h>
 #include <Arduino.h>
@@ -43,6 +46,7 @@ canvas{width:100%;display:block}
 .srow label{display:flex;justify-content:space-between;font-size:0.85em;margin-bottom:3px}
 .srow label span:last-child{color:#4af}
 input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
+input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
 @media(max-width:600px){.cfg-row .card{flex:1 1 100%}}
 #dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#444;margin-right:7px;vertical-align:middle;transition:background 0.3s}
 #dot.on{background:#4f4}
@@ -56,7 +60,6 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
 <h1><span><span id="dot"></span>Follow-Me Car</span><span id="connStatus">Disconnected</span></h1>
 <div style="display:flex;gap:8px;margin-bottom:10px">
   <span class="pill" id="pill-uwb">UWB</span>
-  <span class="pill" id="pill-fix">FIX</span>
 </div>
 <div class="row">
   <div class="card">
@@ -68,8 +71,9 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   </div>
   <div class="card">
     <h2>Motion</h2>
-    <div class="stat"><span>Speed</span><span id="speed" class="val">--</span></div>
-    <div class="stat"><span>RPM</span><span id="rpm" class="val">--</span></div>
+    <div class="stat"><span>Hall Speed</span><span id="speed" class="val">--</span></div>
+    <div class="stat"><span>Fused Speed</span><span id="fusedSpeed" class="val">--</span></div>
+    <div class="stat"><span>Hall Raw</span><span id="hallRaw" class="val">--</span></div>
     <div class="stat"><span>Throttle</span><span id="throttle" class="val">--</span></div>
     <div class="stat"><span>Steering</span><span id="steering" class="val">--</span></div>
     <div class="stat"><span>Cogging</span><span id="cogging" class="val">--</span></div>
@@ -94,18 +98,35 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   </div>
 </div>
 <div class="row">
-  <div class="card" style="flex:0 0 auto">
+  <div class="card" style="flex:0 1 340px">
     <h2>Drive Mode</h2>
     <div style="display:flex;gap:8px">
-      <button class="btn" id="btn-REMOTE"       onclick="setMode('REMOTE')">Remote</button>
+      <button class="btn" id="btn-SETPOINT"       onclick="setMode('SETPOINT')">Setpoint</button>
       <button class="btn" id="btn-DIRECT"       onclick="setMode('DIRECT')">Direct</button>
       <button class="btn" id="btn-STOPPED"      onclick="setMode('STOPPED')">Stopped</button>
+    </div>
+    <div class="srow" style="margin-top:10px">
+      <label><span>Target Speed (Setpoint)</span><span id="v_rSp">0.0 mph</span></label>
+      <input type="range" id="setpointSpeedMph" min="0" max="4.0" step="0.1" value="0" disabled>
+    </div>
+    <div class="srow">
+      <label><span>Throttle</span><span id="v_dThr">0%</span></label>
+      <input type="range" id="directThrottlePct" min="-100" max="100" step="1" value="0" disabled>
+    </div>
+    <div class="srow">
+      <label><span>Steering Servo</span><span id="v_dSteer">0%</span></label>
+      <input type="range" id="directSteerPct" min="-100" max="100" step="1" value="0" disabled>
+    </div>
+    <div class="srow" style="margin-bottom:0">
+      <label><span>Pan Servo</span><span id="v_dPan">0%</span></label>
+      <input type="range" id="directPanPct" min="-100" max="100" step="1" value="0" disabled>
     </div>
   </div>
 </div>
 <div class="row">
   <div class="card">
-    <h2>Speed (mph) + Throttle — last 10s</h2>
+    <h2 style="display:flex;justify-content:space-between;align-items:center">Speed (mph) + Throttle — last 10s
+      <button class="btn" id="btnGraphPause" onclick="toggleGraphPause()">Pause</button></h2>
     <canvas id="speedGraph" height="80"></canvas>
   </div>
 </div>
@@ -140,6 +161,10 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
       <label><span>KI — speed PID integral gain</span><span id="v_ki">--</span></label>
       <input type="range" id="ki" min="0.0" max="1.0" step="0.025">
     </div>
+    <div class="srow">
+      <label><span>KD — speed PID derivative gain</span><span id="v_kd">--</span></label>
+      <input type="range" id="kd" min="0.0" max="1.0" step="0.01">
+    </div>
   </div>
   <div class="card">
     <h2>Steering</h2>
@@ -165,39 +190,35 @@ input[type=range]{width:100%;accent-color:#4af;cursor:pointer}
   <div class="card">
     <h2>UWB Filtering</h2>
     <div class="srow">
-      <label><span>Kalman Q — process noise, higher = faster tracking</span><span id="v_uQ">--</span></label>
-      <input type="range" id="uwbKalmanQ" min="2.0" max="16.0" step="0.5">
-    </div>
-    <div class="srow">
-      <label><span>Kalman R — sensor noise, lower = more trust</span><span id="v_uR">--</span></label>
-      <input type="range" id="uwbKalmanR" min="19.0" max="150.0" step="2.5">
-    </div>
-    <div class="srow">
       <label><span>Outlier Reject — discard jumps larger than this</span><span id="v_uOr">--</span></label>
       <input type="range" id="uwbOutlierRejectCm" min="8.0" max="60.0" step="1.0">
     </div>
   </div>
   <div class="card">
-    <h2>Fusion</h2>
+    <h2>Fused Speed KF</h2>
     <div class="srow">
-      <label><span>Sensor Timeout — seconds without fix before stale</span><span id="v_fT">--</span></label>
-      <input type="range" id="sensorTimeoutSec" min="0.5" max="8.0" step="0.5">
+      <label><span>Enc R — encoder noise below the ramp</span><span id="v_fER">--</span></label>
+      <input type="range" id="fusedEncR" min="-5" max="0" step="0.05">
     </div>
     <div class="srow">
-      <label><span>Bearing R (UWB) — lower = trust each UWB fix more</span><span id="v_fR">--</span></label>
-      <input type="range" id="fusionRUwb" min="25.0" max="200.0" step="5.0">
+      <label><span>Hall R — hall noise, higher = trust encoder more</span><span id="v_fHR">--</span></label>
+      <input type="range" id="fusedHallR" min="-4" max="1" step="0.05">
     </div>
     <div class="srow">
-      <label><span>Stale Threshold — freeze steering/throttle above</span><span id="v_fSU">--</span></label>
-      <input type="range" id="fusionStaleUncertainty" min="50.0" max="400.0" step="10.0">
+      <label><span>Ramp Start — encoder fade begins</span><span id="v_fRs">--</span></label>
+      <input type="range" id="fusedRampStartMph" min="0.5" max="4.0" step="0.1">
     </div>
     <div class="srow">
-      <label><span>Innov Mean Alpha — how fast mean tracks real movement</span><span id="v_fMa">--</span></label>
-      <input type="range" id="fusionInnovMeanAlpha" min="0.1" max="0.8" step="0.05">
+      <label><span>Ramp End — encoder cut off above this</span><span id="v_fRe">--</span></label>
+      <input type="range" id="fusedRampEndMph" min="1.0" max="5.0" step="0.1">
     </div>
     <div class="srow">
-      <label><span>Innov EWMA Alpha — erratic spike speed and decay</span><span id="v_fEa">--</span></label>
-      <input type="range" id="fusionInnovEwmaAlpha" min="0.025" max="0.2" step="0.005">
+      <label><span>2D Q Speed — process noise beyond what accel explains</span><span id="v_f2Qs">--</span></label>
+      <input type="range" id="fused2QSpeed" min="-6" max="-1" step="0.05">
+    </div>
+    <div class="srow">
+      <label><span>2D Q Bias — accel-bias drift rate</span><span id="v_f2Qb">--</span></label>
+      <input type="range" id="fused2QBias" min="-8" max="-3" step="0.05">
     </div>
   </div>
 </div>
@@ -226,20 +247,31 @@ function set(id, v) { const el = document.getElementById(id); if (el) el.textCon
 function cls(id, c) { const el = document.getElementById(id); if (el) el.className = c; }
 function setPill(id, q) { const el = document.getElementById(id); if (el) el.className = 'pill ' + ['good','deg','lost'][q]; }
 
-const HISTORY = 100;
+const HISTORY = 500;  // 10s window at the 50 Hz control tick rate (samples arrive batched per WS push)
 const speedBuf    = new Array(HISTORY).fill(0);
+const encBuf      = new Array(HISTORY).fill(0);
+const fused2Buf   = new Array(HISTORY).fill(0);
 const targetBuf   = new Array(HISTORY).fill(0);
 const throttleBuf = new Array(HISTORY).fill(0);
 let _maxSpeedMph = 0;
-const seriesVisible = { speed: true, target: true, throttle: true };
+const seriesVisible = { speed: true, enc: true, fused2: true, target: true, throttle: true };
+let _graphPaused = false;
+function toggleGraphPause() {
+  _graphPaused = !_graphPaused;
+  const b = document.getElementById('btnGraphPause');
+  b.textContent = _graphPaused ? 'Resume' : 'Pause';
+  b.className = 'btn' + (_graphPaused ? ' active' : '');
+}
 const legendBounds  = [];
 
 function render(d) {
-  const valid = d.fixQ < 2;  // fusion fix quality drives staleness styling of the fusion-fed readouts
-  ['REMOTE','DIRECT','STOPPED'].forEach(m => {
+  const valid = d.uwbQ < 2;  // UWB fix age drives staleness styling of the UWB-fed readouts
+  ['SETPOINT','DIRECT','STOPPED'].forEach(m => {
     const b = document.getElementById('btn-' + m);
     if (b) b.className = 'btn' + (d.navState === m ? ' active' : '');
   });
+  directEnable(d.navState === 'DIRECT');
+  setpointEnable(d.navState === 'SETPOINT');
   set('dist',     d.dist.toFixed(0) + ' cm');
   set('angle',    d.angle.toFixed(1) + '°');
   set('navState', d.navState);
@@ -248,7 +280,8 @@ function render(d) {
   cls('navState', 'val');
   set('odometry', (d.odometry / 100).toFixed(1) + ' m');
   set('speed',    d.speed.toFixed(2) + ' mph');
-  set('rpm',      d.rpm.toFixed(0));
+  set('fusedSpeed', d.fSp.toFixed(2) + ' mph');
+  set('hallRaw',  d.hRaw.toFixed(2) + ' mph');
   set('throttle', (d.throttle * 100).toFixed(0) + '%');
   set('steering', d.steering.toFixed(2));
   set('cogging',     d.cogging ? 'YES' : 'no');
@@ -265,42 +298,47 @@ function render(d) {
     slide('throttleScale',       d.cfg.ts,  'v_ts',   v => v.toFixed(3));
     slide('kp',                  d.cfg.kp,  'v_kp',   v => v.toFixed(2));
     slide('ki',                  d.cfg.ki,  'v_ki',   v => v.toFixed(3));
+    slide('kd',                  d.cfg.kd,  'v_kd',   v => v.toFixed(3));
     slide('steeringTrim',        d.cfg.sTr, 'v_sTr',  v => (v >= 0 ? '+' : '') + v.toFixed(2));
     slide('steeringKp',          d.cfg.sKp, 'v_sKp',  v => v.toFixed(4));
     slide('steeringKi',          d.cfg.sKi, 'v_sKi',  v => v.toFixed(4));
     slide('steeringMax',         d.cfg.sMax,'v_sMax',  v => v.toFixed(2));
-    slide('uwbKalmanQ',          d.cfg.uQ,  'v_uQ',   v => v.toFixed(1));
-    slide('uwbKalmanR',          d.cfg.uR,  'v_uR',   v => v.toFixed(1));
     slide('uwbOutlierRejectCm',  d.cfg.uOr, 'v_uOr',  v => v.toFixed(0) + ' cm');
-    slide('sensorTimeoutSec',    d.cfg.fT,  'v_fT',   v => v.toFixed(1) + ' s');
-    slide('fusionRUwb',          d.cfg.fR,  'v_fR',   v => v.toFixed(0));
-    slide('fusionStaleUncertainty',d.cfg.fSU,'v_fSU', v => v.toFixed(0));
-    slide('fusionInnovMeanAlpha', d.cfg.fMa, 'v_fMa',  v => v.toFixed(2));
-    slide('fusionInnovEwmaAlpha',d.cfg.fEa, 'v_fEa',  v => v.toFixed(3));
+    slide('fusedEncR',           d.cfg.fER, 'v_fER',  v => v.toExponential(2));
+    slide('fusedHallR',          d.cfg.fHR, 'v_fHR',  v => v.toExponential(2));
+    slide('fusedRampStartMph',   d.cfg.fRs, 'v_fRs',  v => v.toFixed(1) + ' mph');
+    slide('fusedRampEndMph',     d.cfg.fRe, 'v_fRe',  v => v.toFixed(1) + ' mph');
+    slide('fused2QSpeed',        d.cfg.f2Qs,'v_f2Qs', v => v.toExponential(2));
+    slide('fused2QBias',         d.cfg.f2Qb,'v_f2Qb', v => v.toExponential(2));
     _maxSpeedMph = d.cfg.mxSp;
   }
-  speedBuf.push(d.speed);
-  speedBuf.shift();
-  targetBuf.push(d.tSp || 0);
-  targetBuf.shift();
-  throttleBuf.push(d.throttle);
-  throttleBuf.shift();
-  drawSpeedGraph();
-  // Target arrow: heading error against control's held REMOTE target (same value the
+  // Unpack the batched 50Hz control-tick arrays — one entry per PID tick since the
+  // last push, so the graph sees every tick rather than 10Hz snapshots. Paused =
+  // freeze the window: samples arriving while paused are dropped, not queued.
+  if (!_graphPaused && d.g && d.g.sp) {
+    d.g.sp.forEach((v, i) => {
+      speedBuf.push(v);            speedBuf.shift();
+      encBuf.push(d.g.en[i]);      encBuf.shift();
+      fused2Buf.push(d.g.f2[i]);   fused2Buf.shift();
+      targetBuf.push(d.g.tsp[i]);  targetBuf.shift();
+      throttleBuf.push(d.g.th[i]); throttleBuf.shift();
+    });
+  }
+  if (!_graphPaused) drawSpeedGraph();
+  // Target arrow: heading error against control's held SETPOINT target (same value the
   // steering PID chases; wrap matches the firmware's ±180 convention).
-  let err = d.heading - d.remoteHeading;
+  let err = d.heading - d.setpointHeading;
   while (err >  180) err -= 360;
   while (err < -180) err += 360;
-  drawArrow(err, -d.steering * 90, valid, d.navState === 'REMOTE', 'Target');
-  drawPosView(d.dist, d.angle, d.uwbQ < 2 ? d.uwbAngle : null, d.uwbDist || -1, d.cfg ? d.cfg.fd : 170, d.fixQ);
+  drawArrow(err, -d.steering * 90, valid, d.navState === 'SETPOINT', 'Target');
+  drawPosView(d.dist, d.angle, d.cfg ? d.cfg.fd : 170, d.uwbQ);
   if (d.perf) { _perfData = d.perf; drawPerfGraph(); }
   setPill('pill-uwb', d.uwbQ);
-  setPill('pill-fix', d.fixQ);
 }
 
 function slide(id, val, labelId, fmt) {
   const el = document.getElementById(id);
-  if (document.activeElement !== el) el.value = val;
+  if (document.activeElement !== el) el.value = logSliders[id] ? Math.log10(val) : val;
   set(labelId, fmt(val));
 }
 
@@ -308,12 +346,102 @@ function setMode(m) {
   fetch('/mode?mode=' + m, {method:'POST'});
 }
 
-['throttleScale','minSpeedMph','maxSpeedMph','followDistanceCm','maxDistanceCm','kp','ki',
+// DIRECT effort sliders (negative = brake/reverse + left), one per actuator, fully
+// isolated — each adjusts its axis alone. While any value is nonzero the browser
+// re-sends the triple every 150ms so the firmware's 300ms DIRECT cmd-timeout
+// failsafe stays fed — losing the page cuts throttle like a Pi comms loss.
+const throttleSlider = document.getElementById('directThrottlePct');
+const steerSlider    = document.getElementById('directSteerPct');
+const panSlider      = document.getElementById('directPanPct');
+const directSliders  = [throttleSlider, steerSlider, panSlider];
+let _directTimer = null, _lastDirectSend = 0;
+function sendDirect() {
+  _lastDirectSend = Date.now();
+  const msg = throttleSlider.value + ',' + steerSlider.value + ',' + panSlider.value;
+  // The open WebSocket is the primary path — per-request HTTP jitter can starve
+  // the 300ms cmd timeout and cause throttle dropouts; POST is the fallback.
+  if (ws.readyState === WebSocket.OPEN) ws.send('direct:' + msg);
+  else fetch('/direct?t=' + throttleSlider.value + '&s=' + steerSlider.value +
+             '&p=' + panSlider.value, {method:'POST'});
+}
+function directLabels() {
+  set('v_dThr',   throttleSlider.value + '%');
+  set('v_dSteer', steerSlider.value + '%');
+  set('v_dPan',   panSlider.value + '%');
+}
+function directHeartbeat(on) {
+  if (on && !_directTimer) _directTimer = setInterval(sendDirect, 150);
+  if (!on && _directTimer) { clearInterval(_directTimer); _directTimer = null; }
+}
+// After any slider input: refresh labels, send (rate-limited while dragging; an
+// all-zero state always sends immediately so the actuators neutralize without
+// waiting for the timeout), and keep the heartbeat matched to activity.
+function directTouched() {
+  directLabels();
+  const active = directSliders.some(el => +el.value !== 0);
+  if (!active || Date.now() - _lastDirectSend > 100) sendDirect();
+  directHeartbeat(active);
+}
+// Enables/disables the sliders with the mode; leaving DIRECT snaps all back to zero.
+function directEnable(on) {
+  directSliders.forEach(el => el.disabled = !on);
+  if (!on && (_directTimer || directSliders.some(el => +el.value !== 0))) {
+    directHeartbeat(false);
+    directSliders.forEach(el => el.value = 0);
+    directLabels();
+  }
+}
+directSliders.forEach(el => {
+  el.addEventListener('input', directTouched);
+  el.addEventListener('change', sendDirect);
+});
+
+// SETPOINT speed slider: bench setpoint for the throttle PID (firmware re-sends the
+// held heading with it, so course is unaffected). Same heartbeat/failsafe contract
+// as the DIRECT sliders: re-sent every 150ms while nonzero, cut by the firmware's
+// 300ms cmd timeout when the page goes away.
+const speedSlider = document.getElementById('setpointSpeedMph');
+let _setpointTimer = null, _lastSetpointSend = 0;
+function sendSetpoint() {
+  _lastSetpointSend = Date.now();
+  if (ws.readyState === WebSocket.OPEN) ws.send('setpoint:' + speedSlider.value);
+  else fetch('/setpoint?mph=' + speedSlider.value, {method:'POST'});
+}
+function setpointHeartbeat(on) {
+  if (on && !_setpointTimer) _setpointTimer = setInterval(sendSetpoint, 150);
+  if (!on && _setpointTimer) { clearInterval(_setpointTimer); _setpointTimer = null; }
+}
+// Enables/disables the slider with the mode; leaving SETPOINT snaps it back to zero.
+function setpointEnable(on) {
+  speedSlider.disabled = !on;
+  if (!on && (_setpointTimer || +speedSlider.value !== 0)) {
+    setpointHeartbeat(false);
+    speedSlider.value = 0;
+    set('v_rSp', '0.0 mph');
+  }
+}
+speedSlider.addEventListener('input', () => {
+  const v = +speedSlider.value;
+  set('v_rSp', v.toFixed(1) + ' mph');
+  if (v === 0 || Date.now() - _lastSetpointSend > 100) sendSetpoint();
+  setpointHeartbeat(v !== 0);
+});
+speedSlider.addEventListener('change', sendSetpoint);
+
+// Log-scale sliders: the range element carries log10(value) so one drag spans orders
+// of magnitude with uniform relative resolution; the actual value is what's sent to
+// /config and shown in the label. slide() applies the inverse when syncing from telemetry.
+const logSliders = { fusedEncR: true, fusedHallR: true, fused2QSpeed: true, fused2QBias: true };
+
+['throttleScale','minSpeedMph','maxSpeedMph','followDistanceCm','maxDistanceCm','kp','ki','kd',
  'steeringTrim','steeringKp','steeringKi','steeringMax',
- 'uwbKalmanQ','uwbKalmanR','uwbOutlierRejectCm',
- 'sensorTimeoutSec','fusionRUwb','fusionStaleUncertainty','fusionInnovMeanAlpha','fusionInnovEwmaAlpha'].forEach(id => {
+ 'uwbOutlierRejectCm',
+ 'fusedEncR','fusedHallR','fusedRampStartMph','fusedRampEndMph',
+ 'fused2QSpeed','fused2QBias'].forEach(id => {
   document.getElementById(id).addEventListener('change', () => {
-    fetch('/config?key=' + id + '&value=' + document.getElementById(id).value, {method:'POST'});
+    const raw = document.getElementById(id).value;
+    const val = logSliders[id] ? Math.pow(10, +raw) : raw;
+    fetch('/config?key=' + id + '&value=' + val, {method:'POST'});
   });
 });
 
@@ -338,7 +466,7 @@ function drawSpeedGraph() {
   graphCanvas.width = w; graphCanvas.height = h;
   const pad = 4;
   gctx.clearRect(0, 0, w, h);
-  const maxVal = Math.max(5, _maxSpeedMph, ...speedBuf);
+  const maxVal = Math.max(5, _maxSpeedMph, ...speedBuf, ...encBuf);
   gctx.strokeStyle = '#333';
   gctx.lineWidth = 1;
   gctx.beginPath(); gctx.moveTo(pad, pad); gctx.lineTo(pad, h-pad); gctx.lineTo(w-pad, h-pad); gctx.stroke();
@@ -347,6 +475,24 @@ function drawSpeedGraph() {
   gctx.fillText(maxVal.toFixed(1), pad+2, pad+11);
   gctx.fillText('0', pad+2, h-pad-2);
   const sl = pad + 14, sw = w - sl - pad;
+  // Faint 0.5 mph gridlines with matching y-axis ticks, recomputed from maxVal every
+  // frame so they rescale with the graph. Integer-mph lines are brighter with longer
+  // ticks, and get a value label in the gutter when there's room between them.
+  const mphPx = (h - pad * 2) / maxVal;
+  gctx.lineWidth = 1;
+  for (let i = 1; i * 0.5 < maxVal; i++) {
+    const v = i * 0.5, major = (i % 2 === 0);
+    const y = h - pad - v * mphPx;
+    gctx.strokeStyle = major ? '#2c2c2c' : '#232323';
+    gctx.beginPath(); gctx.moveTo(sl, y); gctx.lineTo(w - pad, y); gctx.stroke();
+    gctx.strokeStyle = '#555';
+    gctx.beginPath(); gctx.moveTo(pad, y); gctx.lineTo(pad + (major ? 5 : 3), y); gctx.stroke();
+    if (major && mphPx >= 14) {
+      gctx.fillStyle = '#555';
+      gctx.font = '9px monospace';
+      gctx.fillText(v.toFixed(0), pad + 2, y - 2);
+    }
+  }
   // Quarter-second ticks (10s window → 40 intervals); every 4th tick marks a full second
   gctx.lineWidth = 1;
   for (let i = 0; i <= 40; i++) {
@@ -369,18 +515,13 @@ function drawSpeedGraph() {
     gctx.stroke();
     gctx.setLineDash([]);
   }
-  // 10s error label — compare against most recent target, not max
-  const avgSpeed  = speedBuf.reduce((a, b) => a + b, 0) / speedBuf.length;
-  const avgTarget = targetBuf.reduce((a, b) => a + b, 0) / targetBuf.length;
-  const avgError  = avgSpeed - avgTarget;
-  gctx.fillStyle = '#fa4';
-  gctx.font = 'bold 14px monospace';
-  gctx.fillText('10s err: ' + (avgError >= 0 ? '+' : '') + avgError.toFixed(2), sl + 4, pad + 14);
   // Legend — top centre (click to toggle)
   legendBounds.length = 0;
   gctx.font = '11px monospace';
   const items = [
-    { key: 'speed',    color: '#4af', label: 'Speed'    },
+    { key: 'speed',    color: '#4af', label: 'Hall'     },
+    { key: 'enc',      color: '#a4f', label: 'Enc'      },
+    { key: 'fused2',   color: '#4f4', label: 'Fused'    },
     { key: 'target',   color: '#666', label: 'Target'   },
     { key: 'throttle', color: '#f66', label: 'Throttle' },
   ];
@@ -398,6 +539,15 @@ function drawSpeedGraph() {
     gctx.globalAlpha = 1.0;
     lx += itemW + 10;
   });
+  // 10s error — centred below the legend, clear of the y-axis max label
+  const avgSpeed  = speedBuf.reduce((a, b) => a + b, 0) / speedBuf.length;
+  const avgTarget = targetBuf.reduce((a, b) => a + b, 0) / targetBuf.length;
+  const avgError  = avgSpeed - avgTarget;
+  gctx.fillStyle = '#fa4';
+  gctx.font = 'bold 12px monospace';
+  gctx.textAlign = 'center';
+  gctx.fillText('10s err: ' + (avgError >= 0 ? '+' : '') + avgError.toFixed(2), sl + sw / 2, pad + 26);
+  gctx.textAlign = 'left';
   // Right axis: throttle scale (0–1)
   gctx.fillStyle = '#f66';
   gctx.font = '11px monospace';
@@ -415,6 +565,30 @@ function drawSpeedGraph() {
       i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
     });
     gctx.strokeStyle = '#f66';
+    gctx.lineWidth = 1;
+    gctx.stroke();
+  }
+  // Fused speed line (green) — the 2-state [speed, accelBias] filter, the PID's feedback
+  if (seriesVisible.fused2) {
+    gctx.beginPath();
+    fused2Buf.forEach((v, i) => {
+      const x = sl + i * step;
+      const y = h - pad - (v / maxVal) * (h - pad * 2);
+      i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
+    });
+    gctx.strokeStyle = '#4f4';
+    gctx.lineWidth = 1;
+    gctx.stroke();
+  }
+  // Encoder speed line (purple) — signed, so backward jitter dips below the axis and clips
+  if (seriesVisible.enc) {
+    gctx.beginPath();
+    encBuf.forEach((v, i) => {
+      const x = sl + i * step;
+      const y = h - pad - (v / maxVal) * (h - pad * 2);
+      i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
+    });
+    gctx.strokeStyle = '#a4f';
     gctx.lineWidth = 1;
     gctx.stroke();
   }
@@ -486,7 +660,7 @@ function drawArrow(targetDeg, steeringDeg, valid, targetActive, thirdLabel) {
 
 const posCanvas = document.getElementById('posView');
 const posCtx    = posCanvas.getContext('2d');
-function drawPosView(dist, angleDeg, uwbAngleDeg, uwbDist, followDistCm, fixQ) {
+function drawPosView(dist, angleDeg, followDistCm, uwbQ) {
   const w = posCanvas.offsetWidth || 200;
   posCanvas.width = w; posCanvas.height = w;
   const cx = w / 2, cy = w / 2;
@@ -541,28 +715,23 @@ function drawPosView(dist, angleDeg, uwbAngleDeg, uwbDist, followDistCm, fixQ) {
     return {tx, ty};
   }
 
-  const fusedCol = fixQ === 0 ? '#4f4' : fixQ === 1 ? '#fa4' : '#f44';
+  // Dot color tracks UWB fix freshness (green/amber/red by uwbQ).
+  const dotCol = uwbQ === 0 ? '#4f4' : uwbQ === 1 ? '#fa4' : '#f44';
 
   if (dist > 0) {
-    // Raw UWB dot (cyan, drawn first so fused renders on top)
-    if (uwbAngleDeg !== null && uwbDist > 0) plotDot(uwbAngleDeg, uwbDist, 4, '#4af', 0.85);
-
-    // Fused dot (semi-transparent so raw dot shows through when they overlap)
-    plotDot(angleDeg, dist, 6, fusedCol, 0.7);
+    plotDot(angleDeg, dist, 6, dotCol, 0.85);
 
     // Distance + angle readout (top-left)
-    posCtx.fillStyle = fusedCol; posCtx.font = 'bold 10px monospace'; posCtx.textAlign = 'left';
+    posCtx.fillStyle = dotCol; posCtx.font = 'bold 10px monospace'; posCtx.textAlign = 'left';
     posCtx.fillText(dist.toFixed(0) + ' cm', 4, 12);
     posCtx.fillText((angleDeg >= 0 ? '+' : '') + angleDeg.toFixed(1) + '°', 4, 23);
   }
 
-  // Legend — fused color matches the dot (tracks fixQ), UWB is always cyan
+  // Legend — dot color tracks fix freshness
   posCtx.font = '10px monospace'; posCtx.textAlign = 'left';
   const ly = w - 4;
-  posCtx.fillStyle = fusedCol; posCtx.fillRect(4,     ly-9, 8, 8);
-  posCtx.fillStyle = '#aaa';   posCtx.fillText('Fused', 15,   ly);
-  posCtx.fillStyle = '#4af';   posCtx.fillRect(w/2+4, ly-9, 8, 8);
-  posCtx.fillStyle = '#aaa';   posCtx.fillText('UWB',  w/2+15, ly);
+  posCtx.fillStyle = dotCol; posCtx.fillRect(4,   ly-9, 8, 8);
+  posCtx.fillStyle = '#aaa'; posCtx.fillText('UWB', 15, ly);
   posCtx.textAlign = 'left';
 }
 
@@ -614,6 +783,29 @@ function drawPerfGraph() {
 </html>
 )HTML";
 
+// Maps the DIRECT bench sliders' per-axis percentages [-100, 100] onto the three
+// actuators (negative = throttle brake/reverse, steering/pan left) and injects them
+// as a synthetic DIRECT frame, so the serial cmd-timeout failsafe governs them — the
+// page must keep re-sending while any effort is nonzero.
+static void direct_effort(float throttlePct, float steeringPct, float panPct) {
+    if (!isfinite(throttlePct) || !isfinite(steeringPct) || !isfinite(panPct)) return;
+    serial_hal_inject_direct(constrain(throttlePct, -100.0f, 100.0f) / 100.0f,
+                             constrain(steeringPct, -100.0f, 100.0f) / 100.0f,
+                             constrain(panPct,      -100.0f, 100.0f) / 100.0f * PAN_MAX_DEG);
+}
+
+// SETPOINT bench slider: injects a target-speed setpoint while re-sending the currently
+// held target heading, so the speed PID is exercised without changing course. Falls
+// back to live yaw before the first heading is seeded; drops the frame if neither is
+// valid (a setpoint frame can't carry speed alone).
+static void setpoint_speed(float mph) {
+    if (!isfinite(mph)) return;
+    float heading = control_setpoint_heading_deg();
+    if (isnan(heading)) heading = imu_get().yaw;
+    if (isnan(heading)) return;
+    serial_hal_inject_setpoint(mph, heading);
+}
+
 void dashboard_init() {
     _server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
         req->send(200, "text/html", DASHBOARD_HTML);
@@ -636,23 +828,40 @@ void dashboard_init() {
             else if (key == "steeringKp")             rtConfig.steeringKp             = val;
             else if (key == "steeringKi")             rtConfig.steeringKi             = val;
             else if (key == "steeringMax")            rtConfig.steeringMax            = val;
-            else if (key == "uwbKalmanQ")             rtConfig.uwbKalmanQ             = val;
-            else if (key == "uwbKalmanR")             rtConfig.uwbKalmanR             = val;
             else if (key == "uwbOutlierRejectCm")     rtConfig.uwbOutlierRejectCm     = val;
-            else if (key == "sensorTimeoutSec")       rtConfig.sensorTimeoutSec       = val;
-            else if (key == "fusionRUwb")             rtConfig.fusionRUwb             = val;
-            else if (key == "fusionStaleUncertainty") rtConfig.fusionStaleUncertainty = val;
-            else if (key == "fusionInnovMeanAlpha")   rtConfig.fusionInnovMeanAlpha   = val;
-            else if (key == "fusionInnovEwmaAlpha")   rtConfig.fusionInnovEwmaAlpha   = val;
+            else if (key == "fusedEncR")              rtConfig.fusedEncR              = val;
+            else if (key == "fusedHallR")             rtConfig.fusedHallR             = val;
+            else if (key == "fusedRampStartMph")      rtConfig.fusedRampStartMph      = val;
+            else if (key == "fusedRampEndMph")        rtConfig.fusedRampEndMph        = val;
+            else if (key == "fused2QSpeed")           rtConfig.fused2QSpeed           = val;
+            else if (key == "fused2QBias")            rtConfig.fused2QBias            = val;
             ESP_LOGI(TAG, "config %s = %.3f", key.c_str(), val);
         }
+        req->send(200);
+    });
+
+    // DIRECT bench slider fallback path — the primary is the WebSocket heartbeat in
+    // the onEvent handler below. Also handy for curl-driven bench scripts:
+    // t = throttle %, s = steering %, p = pan % (each [-100, 100]).
+    _server.on("/direct", HTTP_POST, [](AsyncWebServerRequest* req) {
+        if (req->hasParam("t") && req->hasParam("s") && req->hasParam("p"))
+            direct_effort(req->getParam("t")->value().toFloat(),
+                          req->getParam("s")->value().toFloat(),
+                          req->getParam("p")->value().toFloat());
+        req->send(200);
+    });
+
+    // SETPOINT bench speed-setpoint fallback path (primary is the WebSocket
+    // "setpoint:<mph>" heartbeat).
+    _server.on("/setpoint", HTTP_POST, [](AsyncWebServerRequest* req) {
+        if (req->hasParam("mph")) setpoint_speed(req->getParam("mph")->value().toFloat());
         req->send(200);
     });
 
     _server.on("/mode", HTTP_POST, [](AsyncWebServerRequest* req) {
         if (req->hasParam("mode")) {
             String m = req->getParam("mode")->value();
-            if      (m == "REMOTE")  control_set_mode(ControlMode::REMOTE);
+            if      (m == "SETPOINT")  control_set_mode(ControlMode::SETPOINT);
             else if (m == "DIRECT")  control_set_mode(ControlMode::DIRECT);
             else if (m == "STOPPED") control_set_mode(ControlMode::STOPPED);
             ESP_LOGI(TAG, "mode → %s", m.c_str());
@@ -660,9 +869,25 @@ void dashboard_init() {
         req->send(200);
     });
 
-    _webSocket.onEvent([](AsyncWebSocket*, AsyncWebSocketClient* client, AwsEventType type, void*, uint8_t*, size_t) {
+    _webSocket.onEvent([](AsyncWebSocket*, AsyncWebSocketClient* client, AwsEventType type, void* arg, uint8_t* data, size_t len) {
         if (type == WS_EVT_CONNECT)    ESP_LOGI(TAG, "WS client connected id=%u", client->id());
         if (type == WS_EVT_DISCONNECT) { ESP_LOGI(TAG, "WS client disconnected"); _webSocket.cleanupClients(); }
+        if (type == WS_EVT_DATA) {
+            // Slider heartbeat: "direct:<t>,<s>,<p>" (throttle/steering/pan %) as a
+            // single-frame text message. The payload is a few bytes, so multi-frame
+            // reassembly is deliberately unsupported — anything fragmented or
+            // oversized is dropped, as is a triple that doesn't parse whole.
+            AwsFrameInfo* info = (AwsFrameInfo*)arg;
+            if (info->final && info->index == 0 && info->len == len &&
+                info->opcode == WS_TEXT && len < 32) {
+                char msg[32];
+                memcpy(msg, data, len);
+                msg[len] = '\0';
+                float t, s, p;
+                if (sscanf(msg, "direct:%f,%f,%f", &t, &s, &p) == 3) direct_effort(t, s, p);
+                else if (sscanf(msg, "setpoint:%f", &t) == 1)          setpoint_speed(t);
+            }
+        }
     });
     _server.addHandler(&_webSocket);
     _server.begin();
@@ -674,9 +899,26 @@ static PerfData _perf = {};
 static RateGate _gate{ DASHBOARD_UPDATE_INTERVAL_MS };
 void dashboard_set_perf(const PerfData& p) { _perf = p; }
 
+// 50 Hz control-tick samples batched into the 10 Hz WS push, so the speed graph gets
+// full PID-rate fidelity without raising the push rate (which would cost canvas
+// redraws and connection robustness). Written and drained on the loop task — no locking.
+struct CtrlSample { float hallSpeedMph, encSpeedMph, fusedSpeedMph, targetSpeedMph, throttle; };
+static const uint8_t CTRL_RING_CAP = 12;   // 2× the nominal 5-6 samples per 100ms push
+static CtrlSample _ctrlRing[CTRL_RING_CAP];
+static uint8_t    _ctrlRingCount = 0;
+
+// Buffers one graph sample; called by main.cpp on each control PID tick. Drops the
+// newest sample if a stalled push has filled the ring — the graph shows a brief gap
+// rather than growing unbounded.
+void dashboard_sample_ctrl() {
+    if (_ctrlRingCount >= CTRL_RING_CAP) return;
+    const ControlOutput& ctrl = control_get();
+    const RPMData&       rpm  = rpm_get();
+    _ctrlRing[_ctrlRingCount++] = { rpm.hallSpeedMph, rpm.encSpeedMph, rpm.fusedSpeedMph, ctrl.targetSpeedMph, ctrl.throttle };
+}
+
 void dashboard_update(float lps) {
     const ControlMode    mode  = control_mode();
-    const Pose&          fused = fusion_get();
     const UWBReading&    uwb   = uwb_get();
     const RPMData&       rpm   = rpm_get();
     const ImuData&       imu   = imu_get();
@@ -685,44 +927,68 @@ void dashboard_update(float lps) {
     uint32_t nowMs   = millis();
     uint32_t uwbAge  = nowMs - uwb.timestamp;
     int uwbQ = uwbAge < 500 ? 0 : uwbAge < 1500 ? 1 : 2;
-    int fixQ = fused.uncertainty < rtConfig.fusionStaleUncertainty * 0.5f ? 0 :
-               fused.uncertainty < rtConfig.fusionStaleUncertainty        ? 1 : 2;
     float dt;
     if (!_gate.tick(dt)) return;
 
     _webSocket.cleanupClients();
 
-    char buf[1350];
+    // Drain the control-tick ring into "g" arrays (one entry per 20ms PID tick since
+    // the last push). The scalar speed/throttle/tSp fields stay in the frame as the
+    // instantaneous values for the stat readouts.
+    char gBuf[896];
+    int  gLen = snprintf(gBuf, sizeof(gBuf), "\"g\":{\"sp\":[");
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].hallSpeedMph));
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"en\":[");
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].encSpeedMph));
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"f2\":[");
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].fusedSpeedMph));
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"tsp\":[");
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].targetSpeedMph));
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"th\":[");
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].throttle));
+    snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "]}");
+    _ctrlRingCount = 0;
+
+    char buf[2048];
     snprintf(buf, sizeof(buf),
-        "{\"dist\":%.1f,\"angle\":%.1f,\"uwbAngle\":%.1f,\"uwbDist\":%.1f,\"remoteHeading\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
-        "\"uwbQ\":%d,\"fixQ\":%d,"
-        "\"speed\":%.3f,\"rpm\":%.0f,\"cogging\":%d,\"signChanges\":%d,"
+        "{\"dist\":%.1f,\"angle\":%.1f,\"setpointHeading\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
+        "\"uwbQ\":%d,"
+        "\"speed\":%.3f,\"fSp\":%.3f,\"hRaw\":%.3f,\"cogging\":%d,\"signChanges\":%d,"
         "\"heading\":%.1f,\"cal_rot\":%u,\"cal_acc\":%u,"
         "\"throttle\":%.3f,\"steering\":%.3f,\"tSp\":%.3f,\"lps\":%.0f,"
+        "%s,"
         "\"cfg\":{\"ts\":%.3f,\"sa\":%.3f,\"fd\":%.0f,\"md\":%.0f,\"mnSp\":%.2f,\"mxSp\":%.2f,"
         "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,"
         "\"sTr\":%.3f,\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
-        "\"uQ\":%.2f,\"uR\":%.2f,\"uOr\":%.1f,"
-        "\"fT\":%.2f,\"fR\":%.1f,\"fSU\":%.1f,\"fMa\":%.3f,\"fEa\":%.4f},"
+        "\"uOr\":%.1f,"
+        "\"fER\":%.4g,\"fHR\":%.4g,\"fRs\":%.2f,\"fRe\":%.2f,"
+        "\"f2Qs\":%.4g,\"f2Qb\":%.4g},"
         "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,"
         "\"ca\":%u,\"cm\":%u,\"oa\":%u,\"om\":%u,\"wa\":%u,\"wm\":%u}}",
-        safeF(fused.distanceCm), safeF(fused.fusedAngle), safeF(fused.uwbAngle), safeF(fused.uwbDistCm), safeF(control_remote_heading_deg()),
-        mode == ControlMode::REMOTE  ? "REMOTE"  :
+        safeF(uwb.distCm), safeF(uwb.angleDeg), safeF(control_setpoint_heading_deg()),
+        mode == ControlMode::SETPOINT  ? "SETPOINT"  :
         mode == ControlMode::DIRECT  ? "DIRECT"  :
         mode == ControlMode::STOPPED ? "STOPPED" : "UNKNOWN",
         safeF(rpm.odometryCm),
-        uwbQ, fixQ,
-        safeF(rpm.speedMph), safeF(rpm.rpm), (int)rpm.cogging, rpm.signChanges,
+        uwbQ,
+        safeF(rpm.hallSpeedMph), safeF(rpm.fusedSpeedMph), safeF(rpm.hallRawMph), (int)rpm.cogging, rpm.signChanges,
         safeF(imu.yaw), imu.cal_rot, imu.cal_accel,
         safeF(ctrl.throttle), safeF(ctrl.steering), safeF(ctrl.targetSpeedMph), safeF(lps),
+        gBuf,
         rtConfig.throttleScale, rtConfig.smoothAlpha,
         rtConfig.followDistanceCm, rtConfig.maxDistanceCm,
         rtConfig.minSpeedMph, rtConfig.maxSpeedMph,
         rtConfig.kp, rtConfig.ki, rtConfig.kd,
         rtConfig.steeringTrim, rtConfig.steeringKp, rtConfig.steeringKi, rtConfig.steeringMax,
-        rtConfig.uwbKalmanQ, rtConfig.uwbKalmanR, rtConfig.uwbOutlierRejectCm,
-        rtConfig.sensorTimeoutSec, rtConfig.fusionRUwb,
-        rtConfig.fusionStaleUncertainty, rtConfig.fusionInnovMeanAlpha, rtConfig.fusionInnovEwmaAlpha,
+        rtConfig.uwbOutlierRejectCm,
+        rtConfig.fusedEncR, rtConfig.fusedHallR,
+        rtConfig.fusedRampStartMph, rtConfig.fusedRampEndMph,
+        rtConfig.fused2QSpeed, rtConfig.fused2QBias,
         _perf.imuAvg,  _perf.imuMax,
         _perf.uwbAvg,  _perf.uwbMax,
         _perf.ctrlAvg, _perf.ctrlMax,

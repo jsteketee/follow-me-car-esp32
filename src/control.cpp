@@ -1,5 +1,5 @@
 // Throttle and steering control layer.
-// Owns the control mode (REMOTE / DIRECT / STOPPED — set by the dashboard, never by
+// Owns the control mode (SETPOINT / DIRECT / STOPPED — set by the dashboard, never by
 // serial frames) and computes normalized [-1, 1] throttle and steering outputs from
 // Pi commands and PID controllers. Has no knowledge of PWM, deadband, smoothing, or
 // servo hardware — all of that lives in actuators.cpp.
@@ -17,19 +17,21 @@
 static const char *TAG = "control";
 
 static ControlOutput  _controlOutput = {0.0f, 0.0f};
-static PidController  _throttlePid  = { THROTTLE_PID_KP,  THROTTLE_PID_KI,  THROTTLE_PID_KD  };
+// Output limits feed the PIDs' anti-windup: throttle is one-sided (no reverse in
+// SETPOINT), steering keeps the symmetric [-1, 1] default.
+static PidController  _throttlePid  = { THROTTLE_PID_KP,  THROTTLE_PID_KI,  THROTTLE_PID_KD, 0.0f, 1.0f };
 static PidController  _steeringPid  = { STEERING_PID_KP,  STEERING_PID_KI,  STEERING_PID_KD  };
 static ControlMode    _mode         = ControlMode::STOPPED;  // main.cpp sets DEFAULT_CONTROL_MODE after init
 static ControlMode    _prevMode     = ControlMode::STOPPED;
 static RateGate       _gate{ CONTROL_UPDATE_INTERVAL_MS };
-// REMOTE held heading (deg): seeded from boot yaw on the first update with a valid IMU
+// SETPOINT held heading (deg): seeded from boot yaw on the first update with a valid IMU
 // reading, then overwritten by each valid command frame. NAN until first seeded.
-static float          _remoteHeadingDeg = NAN;
+static float          _setpointHeadingDeg = NAN;
 
-// Human-readable mode name for logs.
-static const char* control_mode_str(ControlMode m) {
+// Human-readable mode name for logs and telemetry.
+const char* control_mode_str(ControlMode m) {
     switch (m) {
-        case ControlMode::REMOTE:  return "REMOTE";
+        case ControlMode::SETPOINT:  return "SETPOINT";
         case ControlMode::DIRECT:  return "DIRECT";
         case ControlMode::STOPPED: return "STOPPED";
     }
@@ -45,23 +47,25 @@ ControlMode control_mode() { return _mode; }
 // Returns the latest normalized throttle and steering output.
 const ControlOutput& control_get() { return _controlOutput; }
 
-// Returns the REMOTE held target heading (deg): boot-seeded, overwritten by each valid
+// Returns the SETPOINT held target heading (deg): boot-seeded, overwritten by each valid
 // command frame; NAN until first seeded. Read by the OLED/dashboard heading arrow.
-float control_remote_heading_deg() { return _remoteHeadingDeg; }
+float control_setpoint_heading_deg() { return _setpointHeadingDeg; }
 
-// Initializes the actuator layer and LED indicator pin, and seeds the REMOTE held heading.
+// Initializes the actuator layer and LED indicator pin, and seeds the SETPOINT held heading.
 void control_init() {
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, LOW);
     actuators_init();
-    // Seed the REMOTE held heading from boot yaw. imu_init() blocks until the first
-    // rotation vector arrives (same guarantee fusion_init() relies on), so yaw is valid here.
+    // Seed the SETPOINT held heading from boot yaw. imu_init() blocks until the first
+    // rotation vector arrives, so yaw is valid here.
     const ImuData& imu = imu_get();
-    if (!isnan(imu.yaw)) {
-        _remoteHeadingDeg = imu.yaw;
-        Serial.printf("[%s] ✅ control ready — REMOTE heading seeded from boot yaw=%.1f°\n", TAG, imu.yaw);
+    // timestamp != 0 is the real "IMU delivered data" signal — a dead IMU leaves yaw
+    // zero-initialized (not NaN), so the isnan check alone would seed heading 0.
+    if (imu.timestamp != 0 && !isnan(imu.yaw)) {
+        _setpointHeadingDeg = imu.yaw;
+        Serial.printf("[%s] ✅ control ready — SETPOINT heading seeded from boot yaw=%.1f°\n", TAG, imu.yaw);
     } else {
-        Serial.printf("[%s] ✅ control ready — ⚠️ no IMU yaw at init, REMOTE steering inactive until first command\n", TAG);
+        Serial.printf("[%s] ✅ control ready — ⚠️ no IMU yaw at init, SETPOINT steering inactive until first command\n", TAG);
     }
 }
 
@@ -92,23 +96,19 @@ bool control_update() {
 
     //
     switch (_mode) {
-        case ControlMode::REMOTE: {
-            // Pi-commanded setpoints from the serial RX path. The held heading is seeded
-            // from boot yaw in control_init() and overwritten by each valid command frame.
-            // Cmd-timeout failsafe: if no valid frame for CMD_TIMEOUT_MS (or none ever),
-            // throttle goes neutral (targetSpeed stays NaN → throttle PID resets) but
-            // steering STAYS ACTIVE, holding the last heading — centering the wheels
-            // mid-turn on a comms blip would make the car plow straight. The car stays in
-            // REMOTE and throttle auto-resumes on the next valid frame.
+        case ControlMode::SETPOINT: {
+            // Pi-commanded setpoints. On cmd timeout: throttle → neutral (NaN target
+            // resets the PID), but steering keeps holding the last heading — centering
+            // mid-turn on a comms blip would make the car plow straight.
             const CommandData& cmd = serial_hal_get();
             if (cmd.lastCmdMs != 0 && millis() - cmd.lastCmdMs <= CMD_TIMEOUT_MS) {
                 targetSpeed       = cmd.targetSpeedMph;
-                _remoteHeadingDeg = cmd.targetHeadingDeg;
+                _setpointHeadingDeg = cmd.targetHeadingDeg;
             }
-            if (!isnan(_remoteHeadingDeg)) {
+            if (!isnan(_setpointHeadingDeg)) {
                 // Setpoint 0, measure = heading error wrapped to [-180, 180] (short way
-                // across the 0/360 seam), same while-loop pattern as fusion.cpp correct_bearing().
-                float err = imu_get().yaw - _remoteHeadingDeg;
+                // across the 0/360 seam).
+                float err = imu_get().yaw - _setpointHeadingDeg;
                 while (err >  180.0f) err -= 360.0f;
                 while (err < -180.0f) err += 360.0f;
                 steeringSetpoint = 0.0f;
@@ -117,16 +117,24 @@ bool control_update() {
             break;
         }
         case ControlMode::DIRECT: {
-            // Pi-commanded raw actuator efforts — PIDs bypassed; actuators still apply
-            // deadband/scale/smoothing. Cmd-timeout failsafe: throttle cut, steering
-            // deliberately NOT written so it holds the last commanded position (same
-            // rationale as REMOTE's heading hold).
+            // Pi-commanded raw efforts — PIDs bypassed; actuators still apply deadband/
+            // scale/smoothing. On cmd timeout: throttle cut, steering deliberately not
+            // written so it holds position (same rationale as SETPOINT's heading hold).
             const CommandData& cmd = serial_hal_get();
             directMode = true;
+            // Edge detector so each failsafe event logs once, with the measured frame
+            // gap — distinguishes delivery stalls (gap barely over budget) from a
+            // stopped sender (gap keeps climbing).
+            static bool _directCmdFresh = false;
             if (cmd.lastDirectMs != 0 && millis() - cmd.lastDirectMs <= CMD_TIMEOUT_MS) {
                 _controlOutput.throttle = cmd.directThrottle;
                 _controlOutput.steering = cmd.directSteering;
+                _directCmdFresh = true;
             } else {
+                if (_directCmdFresh)
+                    ESP_LOGW(TAG, "⏱️ DIRECT cmd timeout — throttle cut (last frame %lums ago)",
+                             (unsigned long)(millis() - cmd.lastDirectMs));
+                _directCmdFresh = false;
                 _controlOutput.throttle = 0.0f;
             }
             _controlOutput.targetSpeedMph = 0.0f;  // no speed setpoint in DIRECT
@@ -151,12 +159,10 @@ bool control_update() {
         if (!isnan(targetSpeed)) {
             if (pidTick) {
                 // Normalize to [0,1] so PID gains are independent of the speed scale.
-                // Measure is the hall-effect speed directly (was fusion's fusedSpeedMph,
-                // which merely plumbed the same value through — re-pointed ahead of the
-                // planned fusion strip, per PROJECT_PLAN Phase 2).
-                float norm   = rtConfig.maxSpeedMph > 0.0f ? rtConfig.maxSpeedMph : 1.0f;
-                float pidOut = _throttlePid.update(targetSpeed / norm, rpm_get().speedMph / norm, dt);
-                _controlOutput.throttle = constrain(pidOut, 0.0f, 1.0f);
+                // Measure is the 2-state fused speed (accel-predicted, encoder/hall
+                // corrected). Output arrives already clamped by the PID's outMin/outMax.
+                float norm = rtConfig.maxSpeedMph > 0.0f ? rtConfig.maxSpeedMph : 1.0f;
+                _controlOutput.throttle = _throttlePid.update(targetSpeed / norm, rpm_get().fusedSpeedMph / norm, dt);
             }
             // else hold last throttle until next pidTick
         } else {

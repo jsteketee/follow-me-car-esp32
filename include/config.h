@@ -1,7 +1,7 @@
 #pragma once
 
-// Ordered to follow the data flow: pins → comms → sensors → display → fusion →
-// navigation → control → actuators.
+// Ordered to follow the data flow: pins → comms → sensors → display →
+// control → actuators.
 
 // =============================================================================
 // Pin Assignments
@@ -43,8 +43,9 @@
 // =============================================================================
 // IMU
 // =============================================================================
-#define IMU_POLLING_INTERVAL_MS  10   // How often IMU is polled
-#define IMU_REPORT_INTERVAL_MS   10   // How often IMU reports data
+#define IMU_POLLING_INTERVAL_MS       4    // SHTP drain gate — matched to the rotation report interval so polls are never empty (empty polls cost real loop time, benchmarks.md #4)
+#define IMU_REPORT_INTERVAL_MS        4    // rotation-vector report interval — sensor rounds to its supported grid and actually delivers ~370 Hz (measured 2026-07-16); request 5 for a true 200 Hz
+#define IMU_ACCEL_REPORT_INTERVAL_MS 20    // linear-accel report interval (50 Hz) — only feeds the 50 Hz telemetry lax field; keeping it slow keeps SHTP drains short enough to fit the encoder's poll window
 // #define IMU_ACCEL_PLOTTER           // Uncomment to stream lax/lay/laz to serial plotter
 
 // =============================================================================
@@ -54,8 +55,6 @@
 // Multiply raw int32 angle field by this to get degrees.
 // Set to 0.01f if firmware reports degrees*100 (verify from first-flash log).
 #define DW3000_ANGLE_SCALE     1.0f
-#define UWB_KALMAN_Q           8.0f  // Distance filter process noise; ~3 cm/frame allows tracking at walking speed
-#define UWB_KALMAN_R          20.0f  // Distance filter measurement noise; stationary test: σ≈4cm → σ²≈14-20 cm²
 #define UWB_OUTLIER_REJECT_CM 30.0f  // Reject single-frame distance jumps larger than this
 #define UWB_OUTLIER_MAX_STREAK    3  // Force-accept after this many consecutive rejections
 
@@ -75,10 +74,22 @@
 // AS5600 encoder (cogging detection only)
 #define AS5600_ADDR              0x36      // I2C address (fixed in hardware)
 #define AS5600_COUNTS_PER_REV    4096      // 12-bit absolute encoder resolution
-#define RPM_POLL_INTERVAL_MS     5         // poll AS5600 at 200 Hz
+#define RPM_POLL_INTERVAL_MS     4         // poll AS5600 at 250 Hz
 #define RPM_CM_PER_COUNT         0.000616f // cm of wheel travel per AS5600 encoder count
+// Fused speed — encoder R inflates exponentially toward its ~2 mph trust ceiling
+// (alias limit ~7 mph at 250 Hz), then the measurement is skipped entirely.
+#define RPM_FUSED_ENC_R              0.0794f   // encoder measurement noise at low speed — dashboard-tuned 2026-07-16
+#define RPM_FUSED_HALL_R             0.2f      // hall measurement noise — coarser sensor (~2.7 cm/pulse), starting guess
+#define RPM_FUSED_ENC_RAMP_START_MPH 2.0f      // encoder R inflation begins (matches the empirical trust ceiling)
+#define RPM_FUSED_ENC_RAMP_END_MPH   3.0f      // encoder fully gated out of the fused filter above this
+#define RPM_FUSED_ENC_R_DECADES      6.0f      // decades of R inflation across the ramp — KF weight ~ 1/R, so fade in decades, not linearly
+
+// 2-state fused speed — [speed, accelBias], predicted by IMU forward accel (lax) at
+// 50 Hz, corrected by the encoder (ramped R above) and hall.
+#define RPM_FUSED2_Q_SPEED           0.0003f   // speed process noise per 20ms predict — starting guess
+#define RPM_FUSED2_Q_BIAS            0.000001f // accel-bias random walk per predict — starting guess
 #define RPM_COGGING_FREQ_HZ      30.0f    // measured cogging oscillation frequency (bench test)
-#define RPM_COGGING_CYCLE_SAMPLES 7       // samples per cogging cycle: 1000 / (FREQ_HZ * POLL_MS)
+#define RPM_COGGING_CYCLE_SAMPLES 8       // samples per cogging cycle: 1000 / (FREQ_HZ * POLL_MS)
 #define RPM_COGGING_WINDOW       (RPM_COGGING_CYCLE_SAMPLES * 3)  // analysis window: ~3 full cycles
 #define RPM_COGGING_MIN_SIGN_CHANGES 4     // direction reversals required to flag cogging
 #define RPM_COGGING_MAX_NET_COUNTS   1623  // max net displacement (counts) while flagging cogging (~1cm)
@@ -96,15 +107,6 @@
 #define OLED_WIFI_SPLASH_MS   10000  // how long the boot splash holds after WiFi comes up (shows SSID + dashboard IP)
 
 // =============================================================================
-// Fusion
-// =============================================================================
-#define FUSION_SENSOR_TIMEOUT_SEC  3.0f   // seconds without a fix before uncertainty crosses the stale threshold
-#define FUSION_KALMAN_R_UWB      15.0f  // UWB bearing measurement noise (deg²); stationary test: σ≈3-4° → σ²≈10-15
-#define FUSION_INNOV_MEAN_ALPHA   0.4f   // how fast the innovation mean tracks genuine movement; higher = faster tracking, less sensitive to real motion
-#define FUSION_INNOV_EWMA_ALPHA   0.15f  // innovation EWMA decay: higher = faster spike, faster recovery; lower = slower but smoother
-#define FUSION_STALE_UNCERTAINTY 150.0f // uncertainty (deg²) above which nav treats the estimate as stale; steady state ~17, erratic movement ~120
-
-// =============================================================================
 // Follow behavior — tunables the Pi-side follow port will consume (no onboard consumer
 // since FOLLOW_ME was removed; they still feed rtConfig + dashboard sliders)
 // =============================================================================
@@ -116,20 +118,20 @@
 // =============================================================================
 // Control — mode + throttle/steering PIDs
 // =============================================================================
-#define DEFAULT_CONTROL_MODE        ControlMode::REMOTE  // mode set at end of setup(); dashboard /mode changes it after that
+#define DEFAULT_CONTROL_MODE        ControlMode::SETPOINT  // mode set at end of setup(); dashboard /mode changes it after that
 #define CONTROL_UPDATE_INTERVAL_MS  20     // PID update rate (50 Hz)
-#define THROTTLE_PID_KP             1.7f
-#define THROTTLE_PID_KI             0.5f
-#define THROTTLE_PID_KD             0.0f
+#define THROTTLE_PID_KP             0.5f   // bench-tuned 2026-07-15 on the stand (anti-windup PID, integrator-led)
+#define THROTTLE_PID_KI             0.6f
+#define THROTTLE_PID_KD             0.15f  // spikes on hall-speed quantization steps — set to 0 if throttle chatter matters
 #define STEERING_PID_KP             0.012f  // ≈ 1/90°: maps ±90° error to ±1.0 steering
 #define STEERING_PID_KI             0.006f
 #define STEERING_PID_KD             0.003f
-#define CMD_TIMEOUT_MS              300    // REMOTE failsafe: ms without a valid serial command frame before neutral throttle (steering stays on, holding the last heading)
+#define CMD_TIMEOUT_MS              300    // SETPOINT failsafe: ms without a valid serial command frame before neutral throttle (steering stays on, holding the last heading)
 
 // =============================================================================
 // Actuators — ESC + steering servo output shaping
 // =============================================================================
-#define THROTTLE_SCALE        0.25f  // Max throttle (0.0–1.0)
+#define THROTTLE_SCALE        0.275f // Max throttle (0.0–1.0) — bench-tuned 2026-07-15
 #define THROTTLE_Deadband     0.08f  // Minimum throttle before movement (ESC threshold = 1540µs)
 #define THROTTLE_SMOOTH_ALPHA 0.05f  // Exponential smoothing on throttle output (0=frozen, 1=no smoothing)
 #define STEERING_MAX          0.9f   // Max steering output (0.0–1.0) — caps servo deflection to prevent brownout
@@ -146,7 +148,7 @@
 #define PAN_SERVO_MIN_US         800   // travel endpoint, sweep-verified 2026-07-14
 #define PAN_SERVO_MAX_US        2200   // travel endpoint, sweep-verified 2026-07-14
 #define PAN_SERVO_CENTER_US     1500   // nominal pulse width for anchor boresight = car forward
-#define PAN_SERVO_TRIM_US         28   // mechanical centering offset (µs), added to center — re-derive with a post-±30%-span cal run (last fit's trim was bent by nonlinear edge points)
+#define PAN_SERVO_TRIM_US         80   // mechanical centering offset (µs), added to center — re-derive with a post-±30%-span cal run (last fit's trim was bent by nonlinear edge points)
 #define PAN_SERVO_US_PER_DEG  -10.52f  // signed: pan deg (+right) = (us - center - trim) / this — pan-cal 2026-07-14 (two runs agree ~10.5–11.7 after remount)
 #define PAN_SLEW_DEG_PER_S     50.0f   // max pan slew rate — µs step per 20ms tick derived from PAN_SERVO_US_PER_DEG, so this stays true across recalibrations
 #define PAN_MAX_DEG            55.0f   // symmetric target clamp: one limit both sides for the Pi's benefit, ≤ the shorter side's physical travel at any plausible trim
@@ -154,5 +156,4 @@
 // =============================================================================
 // Misc
 // =============================================================================
-#define SERIAL_REPORT_INTERVAL_MS    100
 #define DASHBOARD_UPDATE_INTERVAL_MS 100

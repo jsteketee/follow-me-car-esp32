@@ -1,15 +1,10 @@
 // serial_hal — 50 Hz USB-CDC JSON telemetry stream for the Pi ROS2 bridge, plus the
-// non-blocking RX path parsing {"target_speed":...,"target_heading":...} command frames
-// (target_speed in mph feeds the onboard speed PID; target_heading is an absolute compass
-// heading in degrees, same convention as the telemetry yaw field, driving the onboard
-// steering PID via heading error wrapped to [-180,180] — see follow-me-car-ros2/
-// PROJECT_PLAN.md "Serial Protocol").
-// Interleaves with ESP_LOG output; the Pi bridge ignores any line not starting with '{'.
+// non-blocking RX path for command frames (protocol: follow-me-car-ros2/PROJECT_PLAN.md).
+// Interleaves with ESP_LOG output; the Pi ignores any line not starting with '{'.
 #include "serial_hal.h"
 #include "uwb.h"
 #include "imu.h"
 #include "rpm.h"
-#include "fusion.h"
 #include "pan.h"
 #include "control.h"
 #include "utils.h"
@@ -38,6 +33,31 @@ static bool   _rxOverflow = false;  // discarding until the next '\n' after buff
 // Returns the latest validated command frame from the Pi.
 const CommandData& serial_hal_get() { return _cmdData; }
 
+// Dashboard bench-test injection: stores a synthetic DIRECT frame exactly as if the
+// Pi had sent it — same slot, same ranges as process_direct_frame, same lastDirectMs
+// stamp feeding the cmd-timeout failsafe. If the Pi is streaming DIRECT frames at the
+// same time, the two sources interleave (newest write wins); that's a bench-only setup.
+void serial_hal_inject_direct(float throttle, float steering, float panDeg) {
+    if (!isfinite(throttle) || !isfinite(steering) || !isfinite(panDeg)) { _cmdRejects++; return; }
+    _cmdData.directThrottle = constrain(throttle, -1.0f, 1.0f);  // negative = brake/reverse, matching the Pi path
+    _cmdData.directSteering = constrain(steering, -1.0f, 1.0f);
+    _cmdData.targetPanDeg   = constrain(panDeg, -90.0f, 90.0f);  // same bound as the Pi's target_pan validation
+    _cmdData.lastDirectMs   = millis();
+}
+
+// Dashboard bench-test injection for SETPOINT: stores a synthetic setpoint frame —
+// speed clamped to the same [0, rtConfig.maxSpeedMph] range process_setpoint_frame
+// enforces, heading normalized to [0, 360) — and stamps lastCmdMs so the SETPOINT
+// cmd-timeout failsafe governs it exactly like Pi frames.
+void serial_hal_inject_setpoint(float speedMph, float headingDeg) {
+    if (!isfinite(speedMph) || !isfinite(headingDeg)) { _cmdRejects++; return; }
+    while (headingDeg >= 360.0f) headingDeg -= 360.0f;
+    while (headingDeg <    0.0f) headingDeg += 360.0f;
+    _cmdData.targetSpeedMph   = constrain(speedMph, 0.0f, rtConfig.maxSpeedMph);
+    _cmdData.targetHeadingDeg = headingDeg;
+    _cmdData.lastCmdMs        = millis();
+}
+
 // Extracts the float following "key": in a JSON line; false if the key is absent or the number is malformed.
 static bool json_get_float(const char* line, const char* key, float* out) {
     const char* p = strstr(line, key);
@@ -58,7 +78,7 @@ static void log_cmd(const char* kind, const char* verdict, float a, float b) {
     Serial.printf("[serial_hal] %s cmd %s  %.2f / %.2f\n", kind, verdict, a, b);
 }
 
-// Parses and validates one complete line as a setpoint frame (REMOTE); updates _cmdData
+// Parses and validates one complete line as a setpoint frame (SETPOINT); updates _cmdData
 // only if both values are present, finite, and in range. Rejects the whole frame
 // otherwise. Returns true when the line carried setpoint keys (even if rejected).
 static bool process_setpoint_frame(const char* line) {
@@ -85,15 +105,16 @@ static bool process_setpoint_frame(const char* line) {
 }
 
 // Parses and validates one complete line as a raw-actuator frame (DIRECT): normalized
-// throttle [0, 1] (no reverse for now) + steering [-1, 1]. Same reject-whole-frame
-// rules as setpoint frames. Returns true when the line carried actuator keys.
+// throttle [-1, 1] (negative = brake/reverse) + steering [-1, 1]. Same
+// reject-whole-frame rules as setpoint frames. Returns true when the line carried
+// actuator keys.
 static bool process_direct_frame(const char* line) {
     float throttle, steering;
     if (!json_get_float(line, "\"throttle\":", &throttle)) return false;
     if (!json_get_float(line, "\"steering\":", &steering)) return false;
 
     if (!isfinite(throttle) || !isfinite(steering)) { _cmdRejects++; log_cmd("direct", "REJECT (non-finite)", throttle, steering); return true; }
-    if (throttle < 0.0f || throttle > 1.0f)         { _cmdRejects++; log_cmd("direct", "REJECT (throttle range)", throttle, steering); return true; }  // no reverse
+    if (throttle < -1.0f || throttle > 1.0f)        { _cmdRejects++; log_cmd("direct", "REJECT (throttle range)", throttle, steering); return true; }
     if (steering < -1.0f || steering > 1.0f)        { _cmdRejects++; log_cmd("direct", "REJECT (steering range)", throttle, steering); return true; }
 
     _cmdData.directThrottle = throttle;
@@ -164,28 +185,32 @@ void serial_hal_update() {
     const UWBReading&    uwb  = uwb_get();
     const ImuData&       imu  = imu_get();
     const RPMData&       rpm  = rpm_get();
-    const Pose&          pose = fusion_get();
     const ControlOutput& ctrl = control_get();
 
     // Command echo: age of the last accepted command frame (-1 = none since boot),
     // so the Pi can verify what the car is acting on and see the failsafe explicitly.
     long cmdAge = _cmdData.lastCmdMs == 0 ? -1 : (long)(millis() - _cmdData.lastCmdMs);
 
+    // Raw-UWB freshness: uwb_dist/uwb_bearing hold their last value through ranging
+    // dropouts and outlier rejections, so the Pi needs the fix age (-1 = none since
+    // boot) to tell fresh bearings from stale ones.
+    long uwbAge = uwb.timestamp == 0 ? -1 : (long)(millis() - uwb.timestamp);
+
     Serial.printf(
         "{\"ts\":%lu"
-        ",\"uwb_dist\":%.1f,\"uwb_bearing\":%.2f"
-        ",\"yaw\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,\"lax\":%.3f"
-        ",\"speed\":%.3f,\"odo\":%.1f,\"enc_speed\":%.3f,\"cogging\":%d"
-        ",\"fused_angle\":%.2f,\"fused_dist\":%.1f,\"fused_unc\":%.2f"
+        ",\"uwb_dist\":%.1f,\"uwb_bearing\":%.2f,\"uwb_age\":%ld"
+        ",\"yaw\":%.2f,\"yaw_rate\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,\"lax\":%.3f"
+        ",\"speed\":%.3f,\"odo\":%.1f,\"cogging\":%d"
+        ",\"mode\":\"%s\""
         ",\"cmd_speed\":%.2f,\"cmd_heading\":%.1f,\"cmd_pan\":%.1f,\"cmd_age\":%ld,\"cmd_rejects\":%lu"
         ",\"throttle\":%.3f,\"steering\":%.3f"
         ",\"pan_angle\":%.2f"
         "}\n",
         millis(),
-        uwb.distCm, uwb.angleDeg,
-        imu.yaw, imu.pitch, imu.roll, imu.lax,
-        rpm.speedMph, rpm.odometryCm, rpm.encSpeedMph, (int)rpm.cogging,
-        pose.fusedAngle, pose.distanceCm, pose.uncertainty,
+        uwb.distCm, uwb.angleDeg, uwbAge,
+        imu.yaw, imu.yawRate, imu.pitch, imu.roll, imu.lax,
+        rpm.fusedSpeedMph, rpm.odometryCm, (int)rpm.cogging,
+        control_mode_str(control_mode()),
         _cmdData.targetSpeedMph, _cmdData.targetHeadingDeg, _cmdData.targetPanDeg, cmdAge, (unsigned long)_cmdRejects,
         ctrl.throttle, ctrl.steering,
         pan_get_angle());

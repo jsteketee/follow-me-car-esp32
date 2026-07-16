@@ -244,3 +244,92 @@ fine-grained bus interleaving multiplied the BNO085's multi-transaction event re
 measurable loop cost (fus/nav maxes up ~50µs).
 
 ---
+
+## Benchmark #4 — 2026-07-16
+
+**Note:** A/B test of a faster IMU SHTP drain gate (`IMU_POLLING_INTERVAL_MS` 10 → 2,
+report interval unchanged at 10ms/100Hz), aiming to cut the ~5ms average queue-wait
+on rotation events. **Result: reverted** — see notes. Loop no longer contains
+fusion/nav (estimation moved Pi-side); baseline re-measured on this loop shape.
+
+**Loop config:**
+```
+perfImu.begin();    imu_update();                 perfImu.end();     // ACTIVE
+perfUwb.begin();    uwb_update();                 perfUwb.end();     // ACTIVE
+perfCtrl.begin();   control_update();             perfCtrl.end();    // ACTIVE
+pan_update(...);                                                     // ACTIVE
+perfOled.begin();   oled_update(loopHz.hz);       perfOled.end();    // ACTIVE (render on core 0)
+perfWifi.begin();   wifi_update();                perfWifi.end();    // ACTIVE
+perfRpm.begin();    rpm_update();                 perfRpm.end();     // ACTIVE
+perfDash.begin();   dashboard_update(loopHz.hz);  perfDash.end();    // ACTIVE
+perfSerial.begin(); serial_hal_update();          perfSerial.end();  // ACTIVE
+```
+
+**Timing config:** as #3 except `IMU_POLLING_INTERVAL_MS` = 10 (A) vs 2 (B).
+
+**UWB state:** anchor disconnected for both compared runs (uwb=0Hz); motor off,
+dashboard closed. (Candidate run continued with the anchor plugged in mid-run —
+those samples excluded from the averages.)
+
+**Averaged results** _(A: 11 samples, B: 9 samples; first 2 skipped)_**:**
+
+| Metric | A: 10ms gate | B: 2ms gate | Δ |
+|--------|-------------|-------------|---|
+| Loop rate (lps) | 4317 | 3273 | **−24%** |
+| Max loop gap (µs) | 4,273 | 4,587 | +7% |
+| IMU exec avg/max (µs) | 66 / 3,770 | 131 / 3,650 | avg +101% |
+| RPM exec avg/max (µs) | 21 / 386 | 23 / 368 | avg +11% |
+| Encoder rate (Hz) | 200 steady | 190–200 flicker | −2% avg |
+| IMU report rate | 100Hz | 100Hz (unchanged) | — |
+
+**Notes:** Failed the pass criteria (lps within 5%, enc steady 200Hz) and was
+reverted. Empty SHTP polls are not cheap: each gate tick pays an I2C header
+transaction whether or not events are pending, so 5× the poll rate doubled
+imu avg exec and cost ~24% lps. The `[sensor perf] imu=…Hz` readout is a gate-tick
+counter, not a report counter (`_imuHz.update()` runs every tick in imu_update), so
+it read ~470Hz during run B — misleading; would need to move inside the
+SH2_ROTATION_VECTOR case to measure real report rate. Side observation from run B's
+UWB-connected tail: outlier-warning bursts coincide with uwb max ~9.2ms and
+maxLoop 10–14ms spikes — serial log printing from the frame callback is a
+measurable stall, worth its own look.
+
+---
+
+## Benchmark #5 — 2026-07-16
+
+**Note:** Sensor-rate tuning series (runs A–F) following #4, after fixing `_imuHz` to
+count rotation reports instead of gate ticks (so `imu=…Hz` is now trustworthy).
+Landed config: **RV ~370 Hz + linear accel 50 Hz + encoder 250 Hz clean**, at
+~3,080 lps (−32% from the 10ms-gate baseline — accepted trade).
+
+**Loop config:** as #4. **Conditions:** UWB anchor disconnected, motor off, dashboard closed.
+
+**Runs** _(averages; first 2 samples skipped)_**:**
+
+| Run | IMU gate/report | Enc poll | lps | imu Hz | enc Hz | imu avg µs | Verdict |
+|-----|----------------|----------|-----|--------|--------|-----------|---------|
+| A | 10ms / 10ms | 5ms | 4499 | 100 | 200 | 64 | baseline |
+| B | 2ms / 10ms | 5ms | 3390 | 100 | 196 | 128 | fail: −25% lps for 0 extra data |
+| C | 5ms / 10ms | 5ms | 4101 | 100 | 200 | 82 | fail: −9% lps for 0 extra data |
+| D | 5ms / 5ms | 5ms | ~3090 | 200 | 200 | ~150 | pass: 2× data, accepted lps cost |
+| E | 5ms / 5ms | 3ms | ~2980 | ~196 | **220–320 jitter** | ~150 | fail: IMU drains (2–4ms) blow the 3ms window |
+| F | 4ms / 4ms + LA 20ms | 4ms | ~3080 | **~370** | **250 steady** | ~146 | **pass — kept** |
+
+**Notes:** Three durable lessons. (1) *Empty SHTP polls cost real loop time* — B/C
+prove poll rate converts linearly to lps loss with zero data gain; always match the
+drain gate to the report interval. (2) *Report rate is the data knob and the sensor
+rounds it*: requesting 4ms delivered ~370 Hz rotation vectors (2.7ms grid), while 5ms
+delivered exactly 200 — the BNO08x snaps to supported rates. (3) *Drain duration
+bounds the encoder poll window*: each drain blocks ~1.5–4ms of I2C; run E's 3ms
+encoder window couldn't coexist with 2-event drains. Fix that enabled F: linear accel
+demoted to its own 20ms interval (only consumer is the 50 Hz telemetry `lax` field;
+lay/laz unused), shortening drains enough for the 4ms window. Encoder velocity now
+divides by the RateGate's measured dt instead of the nominal interval, so a delayed
+poll can't read as inflated speed. Cogging `RPM_COGGING_CYCLE_SAMPLES` retuned 7→8
+for the 4ms period; state-machine behavior at crawl speeds still needs a stand
+re-validation. One-off `imu max` of 14.7ms observed in F (suspect: DCD auto-save
+flash write — unconfirmed). Ceiling notes: BNO085 caps the shared bus at 400 kHz;
+past this operating point the escape routes are dropping reports, the INT pin
+(latency, not lps), or moving the BNO085 to SPI.
+
+---

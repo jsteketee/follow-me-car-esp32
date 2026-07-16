@@ -3,6 +3,7 @@
 // angle data detects motor cogging — oscillation at a reluctance point without net forward motion.
 #include "rpm.h"
 #include "config.h"
+#include "runtime_config.h"
 #include "utils.h"
 #include "esp_log.h"
 #include <Arduino.h>
@@ -44,6 +45,23 @@ static const uint8_t REG_MAGNITUDE = 0x1B; // CORDIC magnitude, 12-bit, high byt
 
 static int      _encLastAngle      = -1;    // -1 = not yet seeded
 static float    _encEmaVelocityMph = 0.0f;  // EMA of signed encoder velocity (forward = positive)
+static AngleKalman  _fused2Kf;              // 2-state fused speed [speed, accelBias] — same struct as the heading filter, speed domain
+                                            // (retired 1-D encoder KF + 1-D fusion archived in test/rpm_testing.cpp)
+static RateGate     _fused2PredictGate{ 20 };  // predict cadence matched to the 50 Hz linear-accel report
+
+// Speed-ramped encoder R for the fused filter; NAN past the ramp end = skip the update
+// (aliased readings are biased, not noisy). Gates on the caller's fused estimate, never
+// the encoder's own reading — an aliased encoder reads slow and would vote itself back in.
+static float fused_enc_r(float estimateMph) {
+    // Sliders can momentarily put end <= start; degrade to a hard cutoff at start.
+    float width = rtConfig.fusedRampEndMph - rtConfig.fusedRampStartMph;
+    if (width <= 0.0f)
+        return fabsf(estimateMph) < rtConfig.fusedRampStartMph ? rtConfig.fusedEncR : NAN;
+    float t = (fabsf(estimateMph) - rtConfig.fusedRampStartMph) / width;
+    if (t >= 1.0f) return NAN;
+    if (t < 0.0f) t = 0.0f;
+    return rtConfig.fusedEncR * powf(10.0f, RPM_FUSED_ENC_R_DECADES * t);
+}
 static RateGate _encPollGate{ RPM_POLL_INTERVAL_MS };
 
 // Circular buffer of recent encoder deltas for cogging analysis.
@@ -152,12 +170,10 @@ static bool analyze_cogging(int& outSignChanges, int& outNetDelta) {
         && (abs(outNetDelta) <= RPM_COGGING_MAX_NET_COUNTS);
 }
 
-// Polls the encoder, pushes the latest delta into the cogging buffer, and updates the cogging flag.
-// Returns true only when a new valid angle was read — failed reads and skipped gates
-// return false, so callers measuring the rate see actual data arrival, not poll attempts.
+// Polls the encoder and updates the cogging flag. 
 static bool update_encoder() {
-    float unused;
-    if (!_encPollGate.tick(unused)) return false;
+    float dt;
+    if (!_encPollGate.tick(dt)) return false;
 
     int angle = read_encoder_angle();
     if (angle < 0) {
@@ -176,10 +192,20 @@ static bool update_encoder() {
     if (delta < -2048) delta += AS5600_COUNTS_PER_REV;
     _encLastAngle = angle;
 
-    // EMA encoder velocity in mph — forward positive, backward negative.
-    float rawVelMph = ((float)(-delta) * RPM_CM_PER_COUNT / (RPM_POLL_INTERVAL_MS / 1000.0f)) * 0.0223694f;
+    // EMA encoder velocity in mph — forward positive, backward negative. Divides by
+    // the gate's measured dt, not the nominal interval: loop stalls (IMU drains) can
+    // delay a poll, and nominal-dt would read those samples as faster than reality.
+    float rawVelMph = ((float)(-delta) * RPM_CM_PER_COUNT / dt) * 0.0223694f;
     _encEmaVelocityMph += RPM_COGGING_ENC_EMA_ALPHA * (rawVelMph - _encEmaVelocityMph);
+    _rpmData.encRawMph   = rawVelMph;
     _rpmData.encSpeedMph = _encEmaVelocityMph;
+
+    // Fused-speed encoder correction (250 Hz), soft-gated by the speed-ramped R.
+    float fused2EncR = fused_enc_r(_fused2Kf.angle);
+    if (!isnan(fused2EncR)) {
+        _fused2Kf.correct(rawVelMph, fused2EncR);
+        _rpmData.fusedSpeedMph = _fused2Kf.angle;
+    }
 
     // Push delta into circular buffer.
     _coggingDeltas[_coggingIdx] = delta;
@@ -187,7 +213,7 @@ static bool update_encoder() {
     if (_coggingIdx == 0) _coggingBufFull = true;
 
     // Cogging detection only meaningful at low speed — above threshold, false positives dominate.
-    if (_rpmData.speedMph >= RPM_COGGING_MAX_SPEED_MPH) {
+    if (_rpmData.hallSpeedMph >= RPM_COGGING_MAX_SPEED_MPH) {
         if (_rpmData.cogging) {
             ESP_LOGI(TAG, "🟢 cogging cleared (speed above threshold)");
             _rpmData.cogging  = false;
@@ -211,7 +237,7 @@ static bool update_encoder() {
             stateStr, (int)rawCogging,
             signChanges, RPM_COGGING_MIN_SIGN_CHANGES,
             abs(netDelta), RPM_COGGING_MAX_NET_COUNTS,
-            _encEmaVelocityMph, _rpmData.speedMph);
+            _encEmaVelocityMph, _rpmData.hallSpeedMph);
     }
 
     if (_cogState == CogState::CLEAR) {
@@ -268,8 +294,15 @@ static void update_hall() {
     if (_rpmData.cogging || stale || periodUs == 0) {
         _hallEmaSpeed    = 0.0f;
         _hallSpikeStreak = 0;
-        _rpmData.rpm      = 0.0f;
-        _rpmData.speedMph = 0.0f;
+        _rpmData.hallRawMph   = 0.0f;
+        _rpmData.hallSpeedMph = 0.0f;
+        // Hall silence above the encoder ramp is a measurement (≈0 mph) — without it
+        // the fused KF deadlocks after a hard stop: encoder gated out, hall silent.
+        // Below the ramp the encoder handles decay; loop-rate zeros would out-vote it.
+        if (fabsf(_fused2Kf.angle) > rtConfig.fusedRampStartMph) {
+            _fused2Kf.correct(0.0f, rtConfig.fusedHallR);
+            _rpmData.fusedSpeedMph = _fused2Kf.angle;
+        }
         return;
     }
 
@@ -284,19 +317,24 @@ static void update_hall() {
     // Reject noise pulses that produce an implausibly large speed jump.
     // Force-accept after RPM_SPIKE_MAX_STREAK consecutive rejections so genuine acceleration isn't blocked.
     bool spike = (_hallEmaSpeed > 0.0f &&
-                  rawSpeed > _rpmData.speedMph * RPM_SPIKE_REJECT_FACTOR &&
+                  rawSpeed > _rpmData.hallSpeedMph * RPM_SPIKE_REJECT_FACTOR &&
                   _hallSpikeStreak < RPM_SPIKE_MAX_STREAK);
     if (spike) {
         ESP_LOGW(TAG, "⚠️ hall spike rejected: raw=%.2f mph  filtered=%.2f mph  streak=%d",
-                 rawSpeed, _rpmData.speedMph, _hallSpikeStreak + 1);
+                 rawSpeed, _rpmData.hallSpeedMph, _hallSpikeStreak + 1);
         _hallSpikeStreak++;
         return;
     }
 
     _hallEmaSpeed    += RPM_EMA_ALPHA * (rawSpeed - _hallEmaSpeed);
     _hallSpikeStreak  = 0;
-    _rpmData.rpm      = motorRpm;
-    _rpmData.speedMph = _hallEmaSpeed;
+    _rpmData.hallRawMph   = rawSpeed;
+    _rpmData.hallSpeedMph = _hallEmaSpeed;
+
+    // Fused-speed hall correction per accepted pulse — raw speed, not the EMA:
+    // the KF smooths on its own, and double-filtering would lag the high-speed input.
+    _fused2Kf.correct(rawSpeed, rtConfig.fusedHallR);
+    _rpmData.fusedSpeedMph = _fused2Kf.angle;
 }
 
 // =============================================================================
@@ -322,8 +360,18 @@ void rpm_init() {
 
 // Updates hall-effect speed/odometry and encoder cogging detection; returns true when
 // a new valid encoder angle was read this call.
-bool rpm_update() {
-    bool encTick = update_encoder();
+bool rpm_update(float fwdAccelMps2) {
+    // 2-state predict before corrections: integrate bias-corrected forward accel
+    // (m/s² → mph/s) at the 50 Hz accel-report cadence.
+    float dt2;
+    if (_fused2PredictGate.tick(dt2) && isfinite(fwdAccelMps2)) {
+        _fused2Kf.predict(fwdAccelMps2 * 2.23694f, dt2, rtConfig.fused2QSpeed, rtConfig.fused2QBias);
+        _rpmData.fusedSpeedMph = _fused2Kf.angle;
+    }
+
+    // True when a fresh AS5600 angle was read this call (poll gate fired and the I2C
+    // read succeeded) — main.cpp counts these to report the encoder sample rate.
+    bool encSampled = update_encoder();
     update_hall();
 
     static uint32_t lastLogMs = 0;
@@ -331,10 +379,10 @@ bool rpm_update() {
     if (now - lastLogMs >= 5) {
         lastLogMs = now;
         // ESP_LOGI(TAG, "speed=%.2fmph  encVel=%.3fmph  cogging=%d  sc=%d",
-        //          _rpmData.speedMph, _encEmaVelocityMph, (int)_rpmData.cogging, _rpmData.signChanges);
+        //          _rpmData.hallSpeedMph, _encEmaVelocityMph, (int)_rpmData.cogging, _rpmData.signChanges);
     }
 
-    return encTick;
+    return encSampled;
 }
 
 // Returns the latest RPM reading.

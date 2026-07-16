@@ -39,13 +39,16 @@ void actuators_set(float throttle, float steering) {
 
     // Apply deadband and scale: t=0 → neutral (0), t>0 → jump to deadband then scale up to throttleScale.
     // The jump ensures any non-zero throttle immediately overcomes the ESC's dead zone.
+    // The brake side (t<0) keeps the engagement jump but ignores throttleScale: the
+    // scale limits propulsion power, while braking should reach full strength — so
+    // t=-1 maps to the full -1.0 output (1000µs).
     float t = _smoothThrottle;
 
     float scaledThrottle;
     if (t > 0.0f) {
         scaledThrottle = rtConfig.throttleDeadband + t * (rtConfig.throttleScale - rtConfig.throttleDeadband);
     } else if (t < 0.0f) {
-        scaledThrottle = -(rtConfig.throttleDeadband + (-t) * (rtConfig.throttleScale - rtConfig.throttleDeadband));
+        scaledThrottle = -(rtConfig.throttleDeadband + (-t) * (1.0f - rtConfig.throttleDeadband));
     } else {
         scaledThrottle = 0.0f;
     }

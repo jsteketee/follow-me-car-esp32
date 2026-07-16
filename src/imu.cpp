@@ -34,24 +34,32 @@ static void quaternionToEuler(float qw, float qx, float qy, float qz)
 static void enableReports()
 {
     bno.enableReport(SH2_ROTATION_VECTOR, IMU_REPORT_INTERVAL_MS * 1000);
-    bno.enableReport(SH2_LINEAR_ACCELERATION, IMU_REPORT_INTERVAL_MS * 1000);
+    bno.enableReport(SH2_LINEAR_ACCELERATION, IMU_ACCEL_REPORT_INTERVAL_MS * 1000);
     // bno.enableReport(SH2_ACCELEROMETER, IMU_REPORT_INTERVAL_MS * 1000);
     // bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_REPORT_INTERVAL_MS * 1000);
 }
 
 void imu_init()
 {
-    if (!bno.begin_I2C(0x4B))
-    {
-        Serial.printf("[%s] ❌ BNO085 not found\n", TAG);
-        return;
+    // The BNO085 boots slower than the ESP32 and its SH-2 I2C interface doesn't
+    // respond while still starting up, so a single begin attempt can lose the race
+    // and fail "randomly". Retry a few times before giving up; if all attempts fail,
+    // imu_update() keeps retrying at runtime instead of staying dead.
+    for (int attempt = 1; !bno.begin_I2C(0x4B); attempt++) {
+        if (attempt >= 5) {
+            Serial.printf("[%s] ❌ BNO085 not found after %d attempts — will keep retrying from imu_update\n",
+                          TAG, attempt);
+            return;
+        }
+        Serial.printf("[%s] ⚠️ BNO085 begin failed (attempt %d/5) — retrying\n", TAG, attempt);
+        delay(250);
     }
     enableReports();
     sh2_setDcdAutoSave(true);
 
     // Poll until the first rotation vector event arrives (or 3s timeout).
     // This consumes the power-on reset event so imu_update() never sees a false-positive
-    // reset warning, and gives fusion_init() a valid initial yaw to seed the bearing.
+    // reset warning, and gives control_init() a valid initial yaw to seed the held heading.
     uint32_t deadline = millis() + 3000;
     while (millis() < deadline) {
         if (bno.getSensorEvent(&_sensorEvent) &&
@@ -79,14 +87,24 @@ void imu_init()
 // Need to figure this out.
 void imu_update()
 {
-    // Exit early if IMU isn't ready, or if it's not time for an update yet
-    if (!imu_ready) return;
+    // Boot-failure recovery: begin_I2C never succeeded, so retry a full init every 2s
+    // instead of staying dead until a power cycle. begin_I2C blocks for a while when
+    // the chip is absent, but with no gyro the car is flying blind anyway.
+    if (!imu_ready) {
+        static uint32_t _lastBeginRetryMs = 0;
+        if (millis() - _lastBeginRetryMs < 2000) return;
+        _lastBeginRetryMs = millis();
+        if (bno.begin_I2C(0x4B)) {
+            enableReports();
+            sh2_setDcdAutoSave(true);
+            bno.wasReset();
+            imu_ready = true;
+            ESP_LOGW(TAG, "✅ BNO085 recovered after failed init");
+        }
+        return;
+    }
     float dt;
     if (!_gate.tick(dt)) return;
-
-    // Update and expose the IMU update rate tracker
-    _imuHz.update();
-    _imuData.update_hz = (uint32_t)_imuHz.hz;
 
     if (bno.wasReset())
     {
@@ -94,11 +112,29 @@ void imu_update()
         enableReports();
     }
 
-    int eventsRead = 0;
+    // Dead-stream recovery: reports stopped for >1s with no reset event — the SH-2
+    // session is wedged. Re-run the init handshake, rate-limited to every 2s so a
+    // truly dead chip doesn't turn the loop into a string of blocking begins.
+    if (_imuData.timestamp != 0 && millis() - _imuData.timestamp > 1000) {
+        static uint32_t _lastReinitMs = 0;
+        if (millis() - _lastReinitMs >= 2000) {
+            _lastReinitMs = millis();
+            ESP_LOGW(TAG, "⚠️ BNO085 stream dead >1s — reinitializing");
+            if (bno.begin_I2C(0x4B)) {
+                enableReports();
+                bno.wasReset();
+                ESP_LOGW(TAG, "✅ BNO085 reinitialized");
+            }
+        }
+    }
+
+    int eventsRead    = 0;
+    int rotationsRead = 0;  // rotation-vector reports this drain — feeds update_hz so it counts data, not polls
     while (eventsRead < 10 && bno.getSensorEvent(&_sensorEvent)) {
         eventsRead++;
         switch (_sensorEvent.sensorId) {
         case SH2_ROTATION_VECTOR: {
+            rotationsRead++;
             quaternionToEuler(
                 _sensorEvent.un.rotationVector.real,
                 _sensorEvent.un.rotationVector.i,
@@ -119,6 +155,7 @@ void imu_update()
             }
             _prevYaw   = _imuData.yaw;
             _prevYawMs = nowMsYaw;
+            _imuData.timestamp = nowMsYaw;
             static bool headingCalLogged = false;
             if (!headingCalLogged && _imuData.cal_rot == 3) {
                 ESP_LOGI(TAG, "✅ Heading calibrated");
@@ -173,6 +210,11 @@ void imu_update()
     }
     if (eventsRead == 10)
         ESP_LOGW(TAG, "⚠️ IMU sensor buffer hit cap");
+
+    // Rate of actual rotation reports (not gate ticks) — calling with 0 on empty
+    // drains keeps the rate decaying toward 0 if the sensor stops reporting.
+    _imuHz.update(rotationsRead);
+    _imuData.update_hz = (uint32_t)_imuHz.hz;
 }
 
 const ImuData &imu_get() { return _imuData; }

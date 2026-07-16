@@ -79,9 +79,14 @@ struct RateGate {
 };
 
 // PID controller. Derivative is on measurement (not error) to avoid setpoint-change spikes.
+// Output is clamped to [outMin, outMax], with conditional-integration anti-windup:
+// the integrator only accumulates when the output is unsaturated, or when the error
+// would pull the output back toward the allowed range — so recovery from saturation
+// is immediate instead of waiting for the integral to unwind.
 // Call reset() when re-entering active control to clear stale integrator state.
 struct PidController {
     float kp = 0, ki = 0, kd = 0;
+    float outMin = -1.0f, outMax = 1.0f;
     float integral   = 0;
     float lastMeasure = 0;
     bool  initialized = false;
@@ -90,11 +95,17 @@ struct PidController {
         if (!initialized) { lastMeasure = measure; initialized = true; }
         if (dt > 0.1f) dt = 0.1f;  // clamp first-tick blowup when RateGate _lastMs starts at 0
         float error = setpoint - measure;
-        integral += error * dt;
-        integral = constrain(integral, -1.0f, 1.0f);
         float derivative = -(measure - lastMeasure) / dt;
         lastMeasure = measure;
-        return kp * error + ki * integral + kd * derivative;
+        // Trial-integrate, then keep the new integral only if the resulting output is
+        // in range or the error opposes the saturation direction. The ±1 clamp stays
+        // as a backstop bounding the integral's output authority to ±ki.
+        float newIntegral = constrain(integral + error * dt, -1.0f, 1.0f);
+        float out = kp * error + ki * newIntegral + kd * derivative;
+        if      (out > outMax) { if (error < 0.0f) integral = newIntegral; out = outMax; }
+        else if (out < outMin) { if (error > 0.0f) integral = newIntegral; out = outMin; }
+        else                   { integral = newIntegral; }
+        return out;
     }
 
     void reset() { integral = 0; lastMeasure = 0; initialized = false; }

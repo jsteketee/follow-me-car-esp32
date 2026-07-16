@@ -21,15 +21,14 @@ struct RuntimeConfig {
     float steeringKi;
     float steeringMax;
     // UWB filtering
-    float uwbKalmanQ;
-    float uwbKalmanR;
     float uwbOutlierRejectCm;
-    // Fusion
-    float sensorTimeoutSec;
-    float fusionRUwb;
-    float fusionStaleUncertainty;
-    float fusionInnovMeanAlpha;
-    float fusionInnovEwmaAlpha;
+    // Fused speed KF (accel predict, hall + encoder correct)
+    float fusedEncR;
+    float fusedHallR;
+    float fusedRampStartMph;
+    float fusedRampEndMph;
+    float fused2QSpeed;
+    float fused2QBias;
 };
 
 extern RuntimeConfig rtConfig;

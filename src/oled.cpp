@@ -1,6 +1,6 @@
 // SSD1306 128x64 OLED display. Renders IMU stats, nav state, throttle/steering values, and a heading arrow.
 #include "oled.h"
-#include "fusion.h"
+#include "uwb.h"
 #include "control.h"
 #include "imu.h"
 #include "rpm.h"
@@ -26,12 +26,11 @@ static uint32_t  _frameCount = 0;
 struct OledSnapshot {
     float         lps;
     ControlMode   mode;
-    Pose          fused;
+    UWBReading    uwb;
     ControlOutput output;
     RPMData       rpm;
     WifiInfo      wifi;
-    float         remoteHeadingDeg;  // control's held REMOTE target heading — drives the heading arrow
-    float         yawDeg;            // IMU yaw sampled with the same snapshot, for the arrow's error term
+    uint32_t      imuTsMs;  // millis of the last IMU rotation report — drives the GYRO stale flag
 };
 static OledSnapshot _oledSnap;
 static portMUX_TYPE _oledSnapMux = portMUX_INITIALIZER_UNLOCKED;
@@ -61,6 +60,9 @@ void oled_init() {
         while (true);
     }
     Wire1.setClock(400000);
+    // Overflowing text must clip at the screen edge, not wrap: GFX's default wrap
+    // restarts at x=0 on the next row, dropping stray glyphs into other regions.
+    _oledDisplay.setTextWrap(false);
     Serial.printf("[%s] ✅ OLED ready\n", TAG);
     _oledDisplay.clearDisplay();
     _oledDisplay.display();
@@ -70,7 +72,7 @@ void oled_init() {
     xTaskCreatePinnedToCore(oled_render_task, "oled_render", 4096, nullptr, 1, &_oledRenderTask, 0);
 }
 
-static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long navTimestamp) {
+static void drawHeadingArrow(float tagHeading) {
     // Pivot centered in the top-right box (x 79..127, y 0..49): the arrow's
     // 24px reach fits the box in every direction.
     const int cx = 103, cy = 24, r = 28;
@@ -92,7 +94,7 @@ static void drawHeadingArrow(float tagHeading, float tagDistCm, unsigned long na
     _oledDisplay.fillTriangle(tx, ty, lx, ly, rx, ry, SSD1306_WHITE);
 }
 
-static void screen_1(float lps, ControlMode mode, const Pose& fused, const ControlOutput& output, const ImuData& imu) {
+static void screen_1(float lps, ControlMode mode, const UWBReading& uwb, const ControlOutput& output, const ImuData& imu) {
     _oledDisplay.setTextColor(SSD1306_WHITE);
     _oledDisplay.setTextSize(1);
 
@@ -116,19 +118,11 @@ static void screen_1(float lps, ControlMode mode, const Pose& fused, const Contr
     _oledDisplay.print(imu.cal_rot);
     _oledDisplay.println("/3");
 
-    // _oledDisplay.print("TAG:");
-    // if (isnan(fused.fusedAngle)) {
-    //     _oledDisplay.println("--");
-    // } else {
-    //     _oledDisplay.print(fused.fusedAngle, 0);
-    //     _oledDisplay.println();
-    // }
+    drawHeadingArrow(uwb.angleDeg);
 
-    drawHeadingArrow(fused.fusedAngle, fused.distanceCm, fused.timestamp);
-
-    if (fused.distanceCm >= 0) {
+    if (uwb.distCm >= 0) {
         char distBuf[8];
-        snprintf(distBuf, sizeof(distBuf), "%dcm", (int)fused.distanceCm);
+        snprintf(distBuf, sizeof(distBuf), "%dcm", (int)uwb.distCm);
         _oledDisplay.setTextSize(2);
         int textW = strlen(distBuf) * 12;
         _oledDisplay.setCursor(96 - textW / 2, 40);
@@ -145,28 +139,23 @@ static void screen_1(float lps, ControlMode mode, const Pose& fused, const Contr
     _oledDisplay.print(output.steering*100, 0);
 }
 
-static void screen_2(float lps, ControlMode mode, const Pose& fused, const ControlOutput& output, const RPMData& rpm,
-                     float remoteHeadingDeg, float yawDeg) {
+static void screen_2(float lps, ControlMode mode, const UWBReading& uwb, const ControlOutput& output, const RPMData& rpm,
+                     const WifiInfo& wifi, uint32_t imuTsMs) {
     const int barW = 12, barMargin = 2, barSpacing = 4;
     // barFloor: bottom pixel of bars — reserves 8px text row + 1px gap beneath
     const int barFloor = OLED_HEIGHT - 10;
 
-    // Throttle bar: chevrons (^) stacked from bottom, top = THROTTLE_SCALE
+    // Throttle bar: chevrons (^) stacked from bottom, full height = full [0,1] command
+    // (same fraction the dashboard and screen 1 show; actuators scale to PWM downstream)
     const int chevW = barW, chevH = 3, chevStep = 5;
-    int throttleH = (int)(constrain(output.throttle / THROTTLE_SCALE, 0.0f, 1.0f) * (barFloor + 1));
+    int throttleH = (int)(constrain(output.throttle, 0.0f, 1.0f) * (barFloor + 1));
     for (int y = barFloor - chevH; y >= barFloor - throttleH; y -= chevStep) {
         _oledDisplay.drawLine(barMargin,               y + chevH, barMargin + chevW / 2, y,         SSD1306_WHITE);
         _oledDisplay.drawLine(barMargin + chevW / 2,   y,         barMargin + chevW,     y + chevH, SSD1306_WHITE);
     }
 
-    // Uncertainty bar: fills from bottom, full height = FUSION_STALE_UNCERTAINTY
-    const int uncBarX = barMargin + barW + barSpacing;
-    int uncBarH = constrain((int)(fused.uncertainty / rtConfig.fusionStaleUncertainty * (barFloor + 1)), 0, barFloor + 1);
-    if (uncBarH > 0)
-        _oledDisplay.fillRect(uncBarX, barFloor - uncBarH + 1, barW, uncBarH, SSD1306_WHITE);
-
     // Target speed bar: outline only, full height = maxSpeedMph
-    const int tgtBarX = uncBarX + barW + barSpacing;
+    const int tgtBarX = barMargin + barW + barSpacing;
     float tgtNorm = rtConfig.maxSpeedMph > 0.0f
         ? constrain(output.targetSpeedMph / rtConfig.maxSpeedMph, 0.0f, 1.0f)
         : 0.0f;
@@ -174,24 +163,15 @@ static void screen_2(float lps, ControlMode mode, const Pose& fused, const Contr
     if (tgtBarH > 0)
         _oledDisplay.drawRect(tgtBarX, barFloor - tgtBarH + 1, barW, tgtBarH, SSD1306_WHITE);
 
-    // Full-height outlines for all three bars, drawn within each bar's existing width.
+    // Full-height outlines for both bars, drawn within each bar's existing width.
     _oledDisplay.drawRect(barMargin, 0, barW, barFloor + 1, SSD1306_WHITE);
-    _oledDisplay.drawRect(uncBarX,   0, barW, barFloor + 1, SSD1306_WHITE);
     _oledDisplay.drawRect(tgtBarX,   0, barW, barFloor + 1, SSD1306_WHITE);
 
-    // Display-local arrow math: in REMOTE the arrow is the heading error
-    // wrap±180(yaw − held target heading) — same quantity and sign convention as
-    // fusedAngle (0 = on target, + = target right of nose). The target comes from
-    // control_remote_heading_deg(), which is boot-seeded, so the arrow works from
-    // power-on (NAN only if the IMU had no yaw at init — drawHeadingArrow hides it).
-    // Other modes keep the fusion tag angle while ESP-side fusion lives.
-    float arrowDeg = fused.fusedAngle;
-    if (mode == ControlMode::REMOTE) {
-        arrowDeg = yawDeg - remoteHeadingDeg;  // NAN target propagates → arrow hidden
-        while (arrowDeg >  180.0f) arrowDeg -= 360.0f;
-        while (arrowDeg < -180.0f) arrowDeg += 360.0f;
-    }
-    drawHeadingArrow(arrowDeg, fused.distanceCm, fused.timestamp);
+    // Arrow shows the commanded steering in every mode (SETPOINT PID output or DIRECT
+    // effort): 0 = centered/up, ±90° = full lock. Negated to match the physical
+    // steering direction as mounted — the dashboard's steer arrow applies the same
+    // sign flip. Tag position lives on the dashboard.
+    drawHeadingArrow(-output.steering * 90.0f);
 
     _oledDisplay.setTextSize(1);
     _oledDisplay.setTextColor(SSD1306_WHITE);
@@ -199,8 +179,8 @@ static void screen_2(float lps, ControlMode mode, const Pose& fused, const Contr
     // centered horizontally in the box (x 79..127, center 103).
     const int boxX = 79;
     char valBuf[8];
-    if (!isnan(fused.distanceCm) && fused.distanceCm >= 0)
-        snprintf(valBuf, sizeof(valBuf), "%.1f", fused.distanceCm / 100.0f);
+    if (!isnan(uwb.distCm) && uwb.distCm >= 0)
+        snprintf(valBuf, sizeof(valBuf), "%.1f", uwb.distCm / 100.0f);
     else
         snprintf(valBuf, sizeof(valBuf), "-");  // no distance fix yet
     _oledDisplay.setTextSize(2);
@@ -214,24 +194,37 @@ static void screen_2(float lps, ControlMode mode, const Pose& fused, const Contr
     // Separator between the distance and odometry lines — extends to 2px shy of the box's right border.
     _oledDisplay.drawFastHLine(boxX, 35, 126 - boxX, SSD1306_WHITE);
 
-    // Odometry in centimeters — displayed for distance calibration
-    char odoBuf[8];
-    snprintf(odoBuf, sizeof(odoBuf), "%.0f", rpm.odometryCm);
-    int odoW = (int)strlen(odoBuf) * 12 - 2;
+    // Odometry — centimeters (distance calibration wants cm resolution) until the
+    // 4-char box fills at 9999, then meters. The meters form keeps one decimal by
+    // rendering it at size 1 ("999" + ".9" = 48px of the 49px box); from 1000 m the
+    // integer part alone fills the box and the decimal is dropped.
+    char odoBuf[8], odoFrac[4] = "";
+    if (rpm.odometryCm < 10000.0f) {
+        snprintf(odoBuf, sizeof(odoBuf), "%.0f", rpm.odometryCm);
+    } else {
+        float odoM = rpm.odometryCm / 100.0f;
+        snprintf(odoBuf, sizeof(odoBuf), "%d", (int)odoM);
+        if (odoM < 1000.0f) snprintf(odoFrac, sizeof(odoFrac), ".%d", (int)(odoM * 10.0f) % 10);
+    }
+    int odoW = (int)strlen(odoBuf) * 12 - 2 + (int)strlen(odoFrac) * 6;
     int odoTX = 103 - odoW / 2;
     if (odoTX < boxX) odoTX = boxX;
     _oledDisplay.setCursor(odoTX, 38);
     _oledDisplay.print(odoBuf);
+    if (odoFrac[0]) {
+        // Decimal at size 1, bottom-aligned to the size-2 digits (glyph rows 46–53 vs 38–53).
+        _oledDisplay.setTextSize(1);
+        _oledDisplay.setCursor(_oledDisplay.getCursorX(), 46);
+        _oledDisplay.print(odoFrac);
+    }
     _oledDisplay.setTextSize(1);
 
     _oledDisplay.setTextSize(1);
     _oledDisplay.setTextColor(SSD1306_WHITE);
 
-    // Bar labels, aligned under each bar: throttle, uncertainty, set speed
+    // Bar labels, aligned under each bar: throttle, set speed
     _oledDisplay.setCursor(barMargin, barFloor + 2);
     _oledDisplay.print("Tr");
-    _oledDisplay.setCursor(uncBarX, barFloor + 2);
-    _oledDisplay.print("Uc");
     _oledDisplay.setCursor(tgtBarX, barFloor + 2);
     _oledDisplay.print("Ss");
 
@@ -241,22 +234,40 @@ static void screen_2(float lps, ControlMode mode, const Pose& fused, const Contr
     // Horizontal divider off the vertical bar, 1px of separation above the bottom-aligned mode text.
     _oledDisplay.drawFastHLine(78, 54, OLED_WIDTH - 78, SSD1306_WHITE);
 
-    // Flag label on the bottom line with a bar above it; COG sits on top of that bar when active.
-    _oledDisplay.setCursor(50, barFloor + 2);
+    // Flag label on the bottom line with a bar above it; COG sits on top of that bar
+    // when active. The bar spans the full flag column — bars' right edge to the
+    // vertical divider — with a 4px margin each side (matching the divider-side
+    // margin); "Flag" centers beneath it.
+    const int flagL = tgtBarX + barW + 4;
+    const int flagR = 74;  // 4px short of the divider at x=78
+    const int flagW = flagR - flagL + 1;
+    _oledDisplay.drawFastHLine(flagL, barFloor, flagW, SSD1306_WHITE);
+    _oledDisplay.setCursor(flagL + (flagW - 23) / 2, barFloor + 2);  // "Flag" = 4 chars × 6px − 1px trailing gap
     _oledDisplay.print("Flag");
-    _oledDisplay.drawFastHLine(50, barFloor, 24, SSD1306_WHITE);
+    // Flag indicators, left-aligned to the bar's edge: WiFi pinned at the column top,
+    // fault flags (blinking " *", ~1 Hz) stacked upward from the bar.
+    // WiFi flag: WIFI-J = joined a network (STA), WIFI-H = hosting the fallback AP;
+    // absent while still trying to connect.
+    if (wifi.online) {
+        _oledDisplay.setCursor(flagL, 0);
+        _oledDisplay.print(wifi.sta ? "WIFI-J" : "WIFI-H");
+    }
+    // GYRO flag: no IMU rotation report for >100ms (or none since boot) — heading is
+    // stale and the SETPOINT steering PID is flying blind.
+    if (imuTsMs == 0 || millis() - imuTsMs > 100) {
+        _oledDisplay.setCursor(flagL, barFloor - 18);
+        _oledDisplay.print("GYRO");
+        if ((millis() / 500) % 2 == 0) _oledDisplay.print(" *");
+    }
     if (rpm.cogging) {
-        _oledDisplay.setCursor(50, barFloor - 9);
+        _oledDisplay.setCursor(flagL, barFloor - 9);
         _oledDisplay.print("COG");
-        // Slow-blinking asterisk after COG (~1 Hz, 500ms on/off).
-        if ((millis() / 500) % 2 == 0) {
-            _oledDisplay.print("*");
-        }
+        if ((millis() / 500) % 2 == 0) _oledDisplay.print(" *");
     }
 
     // Control mode — horizontally centered in the bottom-right box, bottom aligned to the screen edge.
     const char* modeStr =
-        mode == ControlMode::REMOTE ? "REMOTE" :
+        mode == ControlMode::SETPOINT ? "SETPOINT" :
         mode == ControlMode::DIRECT ? "DIRECT" :
                                       "STOP";
     _oledDisplay.setCursor(79 + (OLED_WIDTH - 79 - (int)strlen(modeStr) * 6) / 2, 56);
@@ -306,7 +317,7 @@ static void oled_render_task(void*) {
         _oledRenderPerf.begin();
         _oledDisplay.clearDisplay();
         if (!screen_wifi_splash(snap.wifi)) {
-            screen_2(snap.lps, snap.mode, snap.fused, snap.output, snap.rpm, snap.remoteHeadingDeg, snap.yawDeg);
+            screen_2(snap.lps, snap.mode, snap.uwb, snap.output, snap.rpm, snap.wifi, snap.imuTsMs);
         }
         _oledDisplay.display();
         taskENTER_CRITICAL(&_oledSnapMux);
@@ -326,12 +337,11 @@ void oled_update(float lps) {
     taskENTER_CRITICAL(&_oledSnapMux);
     _oledSnap.lps    = lps;
     _oledSnap.mode   = control_mode();
-    _oledSnap.fused  = fusion_get();
+    _oledSnap.uwb    = uwb_get();
     _oledSnap.output = control_get();
     _oledSnap.rpm    = rpm_get();
     _oledSnap.wifi   = wifi_get();
-    _oledSnap.remoteHeadingDeg = control_remote_heading_deg();
-    _oledSnap.yawDeg           = imu_get().yaw;
+    _oledSnap.imuTsMs = imu_get().timestamp;
     taskEXIT_CRITICAL(&_oledSnapMux);
 
     if (_oledRenderTask) xTaskNotifyGive(_oledRenderTask);

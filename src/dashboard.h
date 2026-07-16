@@ -11,4 +11,5 @@ struct PerfData {
 
 void dashboard_init();
 void dashboard_set_perf(const PerfData& p);
+void dashboard_sample_ctrl();  // call on each control PID tick: buffers a 50 Hz graph sample
 void dashboard_update(float lps);

@@ -70,6 +70,10 @@ static void start_services(bool sta) {
 // Begins the first STA attempt and returns immediately; wifi_update() drives the rest.
 void wifi_init() {
     WiFi.mode(WIFI_STA);
+    // Disable modem power save (on by default): DTIM sleep batches inbound packets
+    // into 100-300ms bursts, which starves the 300ms DIRECT cmd-timeout failsafe
+    // fed by the dashboard slider heartbeat. Costs ~80mA — nothing next to the drive motor.
+    WiFi.setSleep(false);
     WiFi.setHostname(WIFI_HOSTNAME);
     start_sta_attempt();
 }

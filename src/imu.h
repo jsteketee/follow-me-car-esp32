@@ -14,6 +14,7 @@ struct ImuData {
     uint8_t  cal_gyro;
     uint32_t update_hz;
     float    latency_us;
+    uint32_t timestamp;    // millis() of the last rotation-vector report; 0 until the first — feeds staleness flags
 };
 
 void            imu_init();

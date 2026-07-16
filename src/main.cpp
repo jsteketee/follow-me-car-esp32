@@ -10,7 +10,6 @@
 #include "wifi_config.h"
 #include "rpm.h"
 #include "dashboard.h"
-#include "fusion.h"
 #include "serial_hal.h"
 #include "pan.h"
 #include "esp_log.h"
@@ -19,10 +18,10 @@ static const char* TAG = "perf";
 static HzTracker   loopHz;
 
 // Execution time per module (avg/max µs over the reporting window).
-static PerfTracker perfImu, perfUwb, perfFusion,
+static PerfTracker perfImu, perfUwb,
                    perfCtrl, perfOled, perfWifi, perfRpm, perfDash, perfSerial;
 
-// New-data arrival rate for actual sensors only (not fusion, control, etc.) —
+// New-data arrival rate for actual sensors only (not control, etc.) —
 // counts updates that delivered fresh data, not polls that came back empty.
 // IMU poll rate is exposed via imu_get().update_hz (tracked internally by imu_update).
 static HzTracker hzUwb, hzEnc;
@@ -32,7 +31,7 @@ static uint32_t maxLoopGapUs = 0;  // longest gap between loop() entries in the 
 
 // Resets every perf tracker and the loop-gap max, and stamps the window start.
 static void perf_window_reset() {
-    perfImu.reset();    perfUwb.reset();  perfFusion.reset();
+    perfImu.reset();    perfUwb.reset();
     perfCtrl.reset();   perfOled.reset(); perfWifi.reset();
     perfRpm.reset();    perfDash.reset(); perfSerial.reset();
     maxLoopGapUs = 0;
@@ -68,7 +67,6 @@ static void perf_report() {
         "  maxLoop=%u"
         "  imu=%u/%u"
         "  uwb=%u/%u"
-        "  fus=%u/%u"
         "  ctrl=%u/%u"
         "  oled=%u/%u"
         "  oledT=%u/%u"
@@ -81,7 +79,6 @@ static void perf_report() {
         maxLoopGapUs,
         perfImu.avg(),    perfImu.maxUs,
         perfUwb.avg(),    perfUwb.maxUs,
-        perfFusion.avg(), perfFusion.maxUs,
         perfCtrl.avg(),   perfCtrl.maxUs,
         perfOled.avg(),   perfOled.maxUs,
         oledTaskAvg,      oledTaskMax,
@@ -122,7 +119,6 @@ void setup()
     pan_init();
     rpm_init();
     dashboard_init();
-    fusion_init();
     serial_hal_init();
 
 #ifdef PAN_CAL_TEST
@@ -148,12 +144,12 @@ void loop()
 
     perfImu.begin();    imu_update();                              perfImu.end();
     perfUwb.begin();    hzUwb.update(uwb_update());               perfUwb.end();
-    perfFusion.begin(); fusion_update();                          perfFusion.end();
-    perfCtrl.begin();   control_update();                         perfCtrl.end();
+    perfCtrl.begin();   bool ctrlTicked = control_update();       perfCtrl.end();
+    if (ctrlTicked) dashboard_sample_ctrl();  // buffer a 50 Hz graph sample per PID tick
     pan_update(serial_hal_get().targetPanDeg);  // µs-cheap: 20ms-gated slew toward the Pi-commanded pan target
     perfOled.begin();   oled_update(loopHz.hz);                   perfOled.end();
     perfWifi.begin();   wifi_update();                            perfWifi.end();
-    perfRpm.begin();    hzEnc.update(rpm_update());               perfRpm.end();
+    perfRpm.begin();    hzEnc.update(rpm_update(imu_get().lax));  perfRpm.end();
     perfDash.begin();   dashboard_update(loopHz.hz);              perfDash.end();
     perfSerial.begin(); serial_hal_update();                      perfSerial.end();
     perf_report();

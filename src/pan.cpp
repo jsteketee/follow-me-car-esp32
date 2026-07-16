@@ -52,11 +52,9 @@ float pan_get_angle() { return pan_us_to_deg(_panUs); }
 
 static RateGate _panTrackGate{ 20 };
 
-// Slews toward the Pi-commanded target (from CommandData, routed by main's loop) at
-// PAN_SLEW_DEG_PER_S, so a large commanded jump becomes slow consistent motion and
-// pan_get_angle stays honest throughout. The target is clamped to the symmetric
-// ±PAN_MAX_DEG contract — one limit both ways even though one side of the mount can
-// physically travel farther; the µs endpoint clamp backstops it.
+// Slews toward the Pi-commanded target at PAN_SLEW_DEG_PER_S so pan_get_angle stays
+// honest through large jumps. Clamped to the symmetric ±PAN_MAX_DEG contract even
+// though one side of the mount travels farther; the µs endpoint clamp backstops it.
 void pan_update(float targetDeg) {
     float dt;
     if (!_panTrackGate.tick(dt)) return;
