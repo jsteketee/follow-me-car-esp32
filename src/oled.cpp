@@ -4,6 +4,7 @@
 #include "control.h"
 #include "imu.h"
 #include "rpm.h"
+#include "serial_hal.h"
 #include "wifi_config.h"
 #include "config.h"
 #include "runtime_config.h"

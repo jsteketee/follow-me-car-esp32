@@ -7,6 +7,8 @@
 #include "rpm.h"
 #include "imu.h"
 #include "control.h"
+#include "actuators.h"
+#include "pan.h"
 #include "serial_hal.h"
 #include "runtime_config.h"
 #include "config.h"
@@ -35,6 +37,11 @@ h1{color:#4af;margin-bottom:10px;font-size:1.1em;display:flex;justify-content:sp
 .row{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap}
 .card{background:#1a1a1a;border-radius:6px;padding:10px;flex:1;min-width:160px}
 .card h2{font-size:0.75em;color:#555;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
+.card.collapsible>h2{cursor:pointer;user-select:none}
+.card.collapsible>h2::before{content:"▾ ";color:#777}
+.card.collapsible.collapsed>h2{margin-bottom:0}
+.card.collapsible.collapsed>h2::before{content:"▸ "}
+.card.collapsible.collapsed>*:not(h2){display:none}
 .stat{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #222}
 .stat:last-child{border-bottom:none}
 .val{color:#4f4;font-weight:bold}
@@ -96,8 +103,6 @@ input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
     <h2>Position</h2>
     <canvas id="posView"></canvas>
   </div>
-</div>
-<div class="row">
   <div class="card" style="flex:0 1 340px">
     <h2>Drive Mode</h2>
     <div style="display:flex;gap:8px">
@@ -107,7 +112,7 @@ input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
     </div>
     <div class="srow" style="margin-top:10px">
       <label><span>Target Speed (Setpoint)</span><span id="v_rSp">0.0 mph</span></label>
-      <input type="range" id="setpointSpeedMph" min="0" max="4.0" step="0.1" value="0" disabled>
+      <input type="range" id="setpointSpeedMph" min="0" max="5.0" step="0.1" value="0" disabled>
     </div>
     <div class="srow">
       <label><span>Throttle</span><span id="v_dThr">0%</span></label>
@@ -122,16 +127,36 @@ input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
       <input type="range" id="directPanPct" min="-100" max="100" step="1" value="0" disabled>
     </div>
   </div>
+  <div class="card" style="flex:0 1 200px">
+    <h2>Servo PWM (µs)</h2>
+    <div class="stat"><span>ESC (throttle)</span><span id="escPwm" class="val">--</span></div>
+    <div class="stat"><span>Steering</span><span id="steerPwm" class="val">--</span></div>
+    <div class="stat"><span>Pan</span><span id="panPwm" class="val">--</span></div>
+  </div>
 </div>
 <div class="row">
-  <div class="card">
+  <div class="card collapsible">
     <h2 style="display:flex;justify-content:space-between;align-items:center">Speed (mph) + Throttle — last 10s
-      <button class="btn" id="btnGraphPause" onclick="toggleGraphPause()">Pause</button></h2>
+      <span><button class="btn" id="btnGraphMode" onclick="toggleGraphMode()">Points</button>
+      <button class="btn" id="btnGraphPause" onclick="toggleGraphPause()">Pause</button></span></h2>
     <canvas id="speedGraph" height="80"></canvas>
   </div>
 </div>
+<!-- Encoder raw-angle graph: sawtooth + total-count/displacement + hall-tick markers -->
+<div class="row">
+  <div class="card collapsible">
+    <h2>Encoder angle 0–4095 (yellow) + total count/displacement (orange) — last 10s</h2>
+    <canvas id="angleGraph" height="80"></canvas>
+  </div>
+</div>
+<div class="row">
+  <div class="card collapsible">
+    <h2>Steering — heading error ° (blue, left) + response (orange, right) — last 10s</h2>
+    <canvas id="steerGraph" height="80"></canvas>
+  </div>
+</div>
 <div class="row cfg-row">
-  <div class="card">
+  <div class="card collapsible">
     <h2>Throttle</h2>
     <div class="srow">
       <label><span>Min Speed — speed at follow distance</span><span id="v_mnSp">--</span></label>
@@ -139,7 +164,7 @@ input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
     </div>
     <div class="srow">
       <label><span>Max Speed — speed at max distance</span><span id="v_mxSp">--</span></label>
-      <input type="range" id="maxSpeedMph" min="0.3" max="4.0" step="0.1">
+      <input type="range" id="maxSpeedMph" min="0.3" max="5.0" step="0.1">
     </div>
     <div class="srow">
       <label><span>Follow Distance — stop below this</span><span id="v_fd">--</span></label>
@@ -165,8 +190,12 @@ input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
       <label><span>KD — speed PID derivative gain</span><span id="v_kd">--</span></label>
       <input type="range" id="kd" min="0.0" max="1.0" step="0.01">
     </div>
+    <div class="srow">
+      <label><span>D Filter — throttle D-term low-pass (1 = off, lower = smoother)</span><span id="v_dFil">--</span></label>
+      <input type="range" id="throttleDFilterAlpha" min="0.05" max="1.0" step="0.05">
+    </div>
   </div>
-  <div class="card">
+  <div class="card collapsible">
     <h2>Steering</h2>
     <div class="srow">
       <label><span>Trim — mechanical bias correction (+ = right)</span><span id="v_sTr">--</span></label>
@@ -187,14 +216,14 @@ input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
   </div>
 </div>
 <div class="row cfg-row">
-  <div class="card">
+  <div class="card collapsible">
     <h2>UWB Filtering</h2>
     <div class="srow">
       <label><span>Outlier Reject — discard jumps larger than this</span><span id="v_uOr">--</span></label>
       <input type="range" id="uwbOutlierRejectCm" min="8.0" max="60.0" step="1.0">
     </div>
   </div>
-  <div class="card">
+  <div class="card collapsible">
     <h2>Fused Speed KF</h2>
     <div class="srow">
       <label><span>Enc R — encoder noise below the ramp</span><span id="v_fER">--</span></label>
@@ -206,11 +235,11 @@ input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
     </div>
     <div class="srow">
       <label><span>Ramp Start — encoder fade begins</span><span id="v_fRs">--</span></label>
-      <input type="range" id="fusedRampStartMph" min="0.5" max="4.0" step="0.1">
+      <input type="range" id="fusedRampStartMph" min="0.5" max="15.0" step="0.1">
     </div>
     <div class="srow">
       <label><span>Ramp End — encoder cut off above this</span><span id="v_fRe">--</span></label>
-      <input type="range" id="fusedRampEndMph" min="1.0" max="5.0" step="0.1">
+      <input type="range" id="fusedRampEndMph" min="1.0" max="15.0" step="0.1">
     </div>
     <div class="srow">
       <label><span>2D Q Speed — process noise beyond what accel explains</span><span id="v_f2Qs">--</span></label>
@@ -223,7 +252,24 @@ input[type=range]:disabled{opacity:0.35;cursor:not-allowed}
   </div>
 </div>
 <div class="row">
-  <div class="card">
+  <div class="card collapsible">
+    <h2>Hall Debounce</h2>
+    <div class="srow">
+      <label><span>Speed Factor — window = this × real pulse period</span><span id="v_dbF">--</span></label>
+      <input type="range" id="debounceSpeedFactor" min="0.2" max="1.0" step="0.05">
+    </div>
+    <div class="srow">
+      <label><span>Min µs — window floor (binds at high speed)</span><span id="v_dbMn">--</span></label>
+      <input type="range" id="debounceMinUs" min="500" max="5000" step="100">
+    </div>
+    <div class="srow">
+      <label><span>Max µs — window ceiling at rest</span><span id="v_dbMx">--</span></label>
+      <input type="range" id="debounceMaxUs" min="5000" max="60000" step="1000">
+    </div>
+  </div>
+</div>
+<div class="row">
+  <div class="card collapsible">
     <h2 style="display:flex;justify-content:space-between;align-items:center">Loop Timing (µs)<span>
       <button class="btn active" id="btnPerfAvg" onclick="setPerfMode('avg')">Avg</button>
       <button class="btn"        id="btnPerfMax" onclick="setPerfMode('max')">Max</button>
@@ -251,10 +297,17 @@ const HISTORY = 500;  // 10s window at the 50 Hz control tick rate (samples arri
 const speedBuf    = new Array(HISTORY).fill(0);
 const encBuf      = new Array(HISTORY).fill(0);
 const fused2Buf   = new Array(HISTORY).fill(0);
+const fused2NoImuBuf = new Array(HISTORY).fill(0);  // fused KF without IMU predict (bench diagnostic)
 const targetBuf   = new Array(HISTORY).fill(0);
 const throttleBuf = new Array(HISTORY).fill(0);
+const angleBuf    = new Array(HISTORY).fill(0);  // encoder raw angle (angle graph)
+const hallTickBuf = new Array(HISTORY).fill(0);  // accepted hall ticks per sample (angle graph markers)
+const encCountBuf = new Array(HISTORY).fill(0);  // encoder total count / displacement (angle graph)
+const dFilterSpeedBuf = new Array(HISTORY).fill(0);  // D-term low-passed speed (speed graph)
+const steerErrBuf  = new Array(HISTORY).fill(0);  // steering heading error deg (steering graph)
+const steerRespBuf = new Array(HISTORY).fill(0);  // steering response (steering graph)
 let _maxSpeedMph = 0;
-const seriesVisible = { speed: true, enc: true, fused2: true, target: true, throttle: true };
+const seriesVisible = { speed: true, enc: true, fused2: true, fusedNoImu: true, dFilterSpd: true, target: true, throttle: true };
 let _graphPaused = false;
 function toggleGraphPause() {
   _graphPaused = !_graphPaused;
@@ -262,16 +315,18 @@ function toggleGraphPause() {
   b.textContent = _graphPaused ? 'Resume' : 'Pause';
   b.className = 'btn' + (_graphPaused ? ' active' : '');
 }
+let _graphPointMode = false;
+function toggleGraphMode() {
+  _graphPointMode = !_graphPointMode;
+  const b = document.getElementById('btnGraphMode');
+  b.textContent = _graphPointMode ? 'Lines' : 'Points';
+  b.className = 'btn' + (_graphPointMode ? ' active' : '');
+  drawSpeedGraph();
+}
 const legendBounds  = [];
 
 function render(d) {
   const valid = d.uwbQ < 2;  // UWB fix age drives staleness styling of the UWB-fed readouts
-  ['SETPOINT','DIRECT','STOPPED'].forEach(m => {
-    const b = document.getElementById('btn-' + m);
-    if (b) b.className = 'btn' + (d.navState === m ? ' active' : '');
-  });
-  directEnable(d.navState === 'DIRECT');
-  setpointEnable(d.navState === 'SETPOINT');
   set('dist',     d.dist.toFixed(0) + ' cm');
   set('angle',    d.angle.toFixed(1) + '°');
   set('navState', d.navState);
@@ -284,6 +339,9 @@ function render(d) {
   set('hallRaw',  d.hRaw.toFixed(2) + ' mph');
   set('throttle', (d.throttle * 100).toFixed(0) + '%');
   set('steering', d.steering.toFixed(2));
+  set('escPwm',   d.escPwm + ' µs');
+  set('steerPwm', d.steerPwm + ' µs');
+  set('panPwm',   d.panPwm + ' µs');
   set('cogging',     d.cogging ? 'YES' : 'no');
   set('signChanges', d.signChanges);
   set('heading',  d.heading.toFixed(1) + '°');
@@ -299,6 +357,7 @@ function render(d) {
     slide('kp',                  d.cfg.kp,  'v_kp',   v => v.toFixed(2));
     slide('ki',                  d.cfg.ki,  'v_ki',   v => v.toFixed(3));
     slide('kd',                  d.cfg.kd,  'v_kd',   v => v.toFixed(3));
+    slide('throttleDFilterAlpha',d.cfg.dFil,'v_dFil', v => v.toFixed(2));
     slide('steeringTrim',        d.cfg.sTr, 'v_sTr',  v => (v >= 0 ? '+' : '') + v.toFixed(2));
     slide('steeringKp',          d.cfg.sKp, 'v_sKp',  v => v.toFixed(4));
     slide('steeringKi',          d.cfg.sKi, 'v_sKi',  v => v.toFixed(4));
@@ -310,6 +369,9 @@ function render(d) {
     slide('fusedRampEndMph',     d.cfg.fRe, 'v_fRe',  v => v.toFixed(1) + ' mph');
     slide('fused2QSpeed',        d.cfg.f2Qs,'v_f2Qs', v => v.toExponential(2));
     slide('fused2QBias',         d.cfg.f2Qb,'v_f2Qb', v => v.toExponential(2));
+    slide('debounceSpeedFactor', d.cfg.dbF, 'v_dbF',  v => v.toFixed(2));
+    slide('debounceMinUs',       d.cfg.dbMn,'v_dbMn', v => (v/1000).toFixed(1) + ' ms');
+    slide('debounceMaxUs',       d.cfg.dbMx,'v_dbMx', v => (v/1000).toFixed(1) + ' ms');
     _maxSpeedMph = d.cfg.mxSp;
   }
   // Unpack the batched 50Hz control-tick arrays — one entry per PID tick since the
@@ -320,11 +382,18 @@ function render(d) {
       speedBuf.push(v);            speedBuf.shift();
       encBuf.push(d.g.en[i]);      encBuf.shift();
       fused2Buf.push(d.g.f2[i]);   fused2Buf.shift();
+      if (d.g.f2n) { fused2NoImuBuf.push(d.g.f2n[i]); fused2NoImuBuf.shift(); }
       targetBuf.push(d.g.tsp[i]);  targetBuf.shift();
       throttleBuf.push(d.g.th[i]); throttleBuf.shift();
+      if (d.g.an) { angleBuf.push(d.g.an[i]); angleBuf.shift(); }
+      if (d.g.hp) { hallTickBuf.push(d.g.hp[i]); hallTickBuf.shift(); }
+      if (d.g.cn) { encCountBuf.push(d.g.cn[i]); encCountBuf.shift(); }
+      if (d.g.dS)   { dFilterSpeedBuf.push(d.g.dS[i]); dFilterSpeedBuf.shift(); }
+      if (d.g.sErr) { steerErrBuf.push(d.g.sErr[i]); steerErrBuf.shift(); }
+      if (d.g.sResp){ steerRespBuf.push(d.g.sResp[i]); steerRespBuf.shift(); }
     });
   }
-  if (!_graphPaused) drawSpeedGraph();
+  if (!_graphPaused) { drawSpeedGraph(); drawAngleGraph(); drawSteerGraph(); }
   // Target arrow: heading error against control's held SETPOINT target (same value the
   // steering PID chases; wrap matches the firmware's ±180 convention).
   let err = d.heading - d.setpointHeading;
@@ -342,8 +411,23 @@ function slide(id, val, labelId, fmt) {
   set(labelId, fmt(val));
 }
 
+// The mode buttons are a purely LOCAL gate for which slider panel may send commands — none of
+// them set the firmware mode. The firmware auto-switches SETPOINT/DIRECT from the shape of the
+// command it receives, so selecting a panel and moving its slider is what drives the switch.
+// STOPPED just disables every slider locally (no command is sent); it does NOT e-stop the
+// firmware. The dashboard never reads navState back to drive its controls.
+let _panel = 'STOPPED';   // local selection; starts with all drive sliders disabled
 function setMode(m) {
-  fetch('/mode?mode=' + m, {method:'POST'});
+  _panel = m;
+  applyPanel();
+}
+function applyPanel() {
+  ['SETPOINT','DIRECT','STOPPED'].forEach(m => {
+    const b = document.getElementById('btn-' + m);
+    if (b) b.className = 'btn' + (_panel === m ? ' active' : '');
+  });
+  directEnable(_panel === 'DIRECT');
+  setpointEnable(_panel === 'SETPOINT');
 }
 
 // DIRECT effort sliders (negative = brake/reverse + left), one per actuator, fully
@@ -428,20 +512,33 @@ speedSlider.addEventListener('input', () => {
 });
 speedSlider.addEventListener('change', sendSetpoint);
 
+// Sync the initial button highlight + slider gating (after the slider consts above exist).
+applyPanel();
+
 // Log-scale sliders: the range element carries log10(value) so one drag spans orders
 // of magnitude with uniform relative resolution; the actual value is what's sent to
 // /config and shown in the label. slide() applies the inverse when syncing from telemetry.
 const logSliders = { fusedEncR: true, fusedHallR: true, fused2QSpeed: true, fused2QBias: true };
 
-['throttleScale','minSpeedMph','maxSpeedMph','followDistanceCm','maxDistanceCm','kp','ki','kd',
+['throttleScale','minSpeedMph','maxSpeedMph','followDistanceCm','maxDistanceCm','kp','ki','kd','throttleDFilterAlpha',
  'steeringTrim','steeringKp','steeringKi','steeringMax',
  'uwbOutlierRejectCm',
  'fusedEncR','fusedHallR','fusedRampStartMph','fusedRampEndMph',
- 'fused2QSpeed','fused2QBias'].forEach(id => {
+ 'fused2QSpeed','fused2QBias',
+ 'debounceSpeedFactor','debounceMinUs','debounceMaxUs'].forEach(id => {
   document.getElementById(id).addEventListener('change', () => {
     const raw = document.getElementById(id).value;
     const val = logSliders[id] ? Math.pow(10, +raw) : raw;
     fetch('/config?key=' + id + '&value=' + val, {method:'POST'});
+  });
+});
+
+// Collapsible cards — click the title to fold/unfold; all start collapsed.
+document.querySelectorAll('.card.collapsible').forEach(card => {
+  card.classList.add('collapsed');
+  card.querySelector('h2').addEventListener('click', e => {
+    if (e.target.closest('button')) return;  // let title-bar buttons (e.g. Pause) work
+    card.classList.toggle('collapsed');
   });
 });
 
@@ -467,28 +564,42 @@ function drawSpeedGraph() {
   const pad = 4;
   gctx.clearRect(0, 0, w, h);
   const maxVal = Math.max(5, _maxSpeedMph, ...speedBuf, ...encBuf);
+  const minVal = -1, range = maxVal - minVal;               // left (speed) axis floor at -1 mph
+  const yv = v => h - pad - ((v - minVal) / range) * (h - pad * 2);
   gctx.strokeStyle = '#333';
   gctx.lineWidth = 1;
   gctx.beginPath(); gctx.moveTo(pad, pad); gctx.lineTo(pad, h-pad); gctx.lineTo(w-pad, h-pad); gctx.stroke();
   gctx.fillStyle = '#555';
   gctx.font = '11px monospace';
   gctx.fillText(maxVal.toFixed(1), pad+2, pad+11);
-  gctx.fillText('0', pad+2, h-pad-2);
+  gctx.fillText('-1', pad+2, h-pad-2);
   const sl = pad + 14, sw = w - sl - pad;
-  // Faint 0.5 mph gridlines with matching y-axis ticks, recomputed from maxVal every
-  // frame so they rescale with the graph. Integer-mph lines are brighter with longer
-  // ticks, and get a value label in the gutter when there's room between them.
-  const mphPx = (h - pad * 2) / maxVal;
+  const step = sw / (HISTORY - 1);
+  // Render a data series as a connected polyline, or as discrete dots when point mode is on.
+  const plotSeries = (buf, color, lw, yfn) => {
+    if (_graphPointMode) {
+      gctx.fillStyle = color;
+      const r = lw + 0.5;
+      buf.forEach((v, i) => { gctx.beginPath(); gctx.arc(sl + i * step, yfn(v), r, 0, 6.283); gctx.fill(); });
+    } else {
+      gctx.beginPath();
+      buf.forEach((v, i) => { const x = sl + i * step, y = yfn(v); i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y); });
+      gctx.strokeStyle = color; gctx.lineWidth = lw; gctx.stroke();
+    }
+  };
+  // 0.5 mph gridlines from -1 to maxVal; integer lines brighter, the 0 line brightest, each
+  // labelled in the gutter when there's room. Rescales with maxVal every frame.
+  const mphPx = (h - pad * 2) / range;
   gctx.lineWidth = 1;
-  for (let i = 1; i * 0.5 < maxVal; i++) {
-    const v = i * 0.5, major = (i % 2 === 0);
-    const y = h - pad - v * mphPx;
-    gctx.strokeStyle = major ? '#2c2c2c' : '#232323';
+  for (let v = -0.5; v < maxVal; v += 0.5) {
+    const zero = Math.abs(v) < 1e-6, major = Number.isInteger(v);
+    const y = yv(v);
+    gctx.strokeStyle = zero ? '#3c3c3c' : (major ? '#2c2c2c' : '#232323');
     gctx.beginPath(); gctx.moveTo(sl, y); gctx.lineTo(w - pad, y); gctx.stroke();
     gctx.strokeStyle = '#555';
     gctx.beginPath(); gctx.moveTo(pad, y); gctx.lineTo(pad + (major ? 5 : 3), y); gctx.stroke();
-    if (major && mphPx >= 14) {
-      gctx.fillStyle = '#555';
+    if ((zero || major) && mphPx >= 11) {
+      gctx.fillStyle = zero ? '#888' : '#555';
       gctx.font = '9px monospace';
       gctx.fillText(v.toFixed(0), pad + 2, y - 2);
     }
@@ -501,19 +612,23 @@ function drawSpeedGraph() {
     gctx.strokeStyle = major ? '#555' : '#2d2d2d';
     gctx.beginPath(); gctx.moveTo(x, h-pad); gctx.lineTo(x, h-pad-(major ? 6 : 3)); gctx.stroke();
   }
-  // Target speed line — drawn as a polyline so it tracks the interpolated setpoint
+  // Target speed line — dashed polyline so it tracks the interpolated setpoint (dots in point mode)
   if (seriesVisible.target) {
-    gctx.strokeStyle = '#666';
-    gctx.lineWidth = 1;
-    gctx.setLineDash([4, 4]);
-    gctx.beginPath();
-    targetBuf.forEach((v, i) => {
-      const x = sl + (i / (HISTORY - 1)) * sw;
-      const y = h - pad - (v / maxVal) * (h - pad * 2);
-      i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
-    });
-    gctx.stroke();
-    gctx.setLineDash([]);
+    if (_graphPointMode) {
+      plotSeries(targetBuf, '#666', 1, yv);
+    } else {
+      gctx.strokeStyle = '#666';
+      gctx.lineWidth = 1;
+      gctx.setLineDash([4, 4]);
+      gctx.beginPath();
+      targetBuf.forEach((v, i) => {
+        const x = sl + i * step;
+        const y = yv(v);
+        i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
+      });
+      gctx.stroke();
+      gctx.setLineDash([]);
+    }
   }
   // Legend — top centre (click to toggle)
   legendBounds.length = 0;
@@ -522,6 +637,8 @@ function drawSpeedGraph() {
     { key: 'speed',    color: '#4af', label: 'Hall'     },
     { key: 'enc',      color: '#a4f', label: 'Enc'      },
     { key: 'fused2',   color: '#4f4', label: 'Fused'    },
+    { key: 'fusedNoImu', color: '#2dd', label: 'F·noIMU' },
+    { key: 'dFilterSpd', color: '#f6f', label: 'D-spd'   },
     { key: 'target',   color: '#666', label: 'Target'   },
     { key: 'throttle', color: '#f66', label: 'Throttle' },
   ];
@@ -548,67 +665,147 @@ function drawSpeedGraph() {
   gctx.textAlign = 'center';
   gctx.fillText('10s err: ' + (avgError >= 0 ? '+' : '') + avgError.toFixed(2), sl + sw / 2, pad + 26);
   gctx.textAlign = 'left';
-  // Right axis: throttle scale (0–1)
+  // Right axis: throttle 0..100%, with 0% aligned to the 0 mph gridline and 100% at the top
+  const zeroY = yv(0);
+  const thrY = v => zeroY - v * (zeroY - pad);
   gctx.fillStyle = '#f66';
   gctx.font = '11px monospace';
   gctx.textAlign = 'right';
   gctx.fillText('100%', w - pad, pad + 11);
-  gctx.fillText('0%',   w - pad, h - pad - 2);
+  gctx.fillText('0%',   w - pad, zeroY - 2);
   gctx.textAlign = 'left';
-  const step = sw / (HISTORY - 1);
-  // Throttle line (red, 0–1 mapped to full graph height)
-  if (seriesVisible.throttle) {
-    gctx.beginPath();
-    throttleBuf.forEach((v, i) => {
-      const x = sl + i * step;
-      const y = h - pad - v * (h - pad * 2);
-      i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
-    });
-    gctx.strokeStyle = '#f66';
-    gctx.lineWidth = 1;
-    gctx.stroke();
-  }
+  // Throttle line (red) — 0% on the 0 mph line, 100% at the top
+  if (seriesVisible.throttle) plotSeries(throttleBuf, '#f66', 1, thrY);
   // Fused speed line (green) — the 2-state [speed, accelBias] filter, the PID's feedback
-  if (seriesVisible.fused2) {
-    gctx.beginPath();
-    fused2Buf.forEach((v, i) => {
-      const x = sl + i * step;
-      const y = h - pad - (v / maxVal) * (h - pad * 2);
-      i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
-    });
-    gctx.strokeStyle = '#4f4';
-    gctx.lineWidth = 1;
-    gctx.stroke();
-  }
+  if (seriesVisible.fused2) plotSeries(fused2Buf, '#4f4', 1, yv);
+  // Fused (no IMU) line (teal) — encoder + hall corrections only, no IMU predict (bench diagnostic)
+  if (seriesVisible.fusedNoImu) plotSeries(fused2NoImuBuf, '#2dd', 1, yv);
+  // D-term input speed (magenta) — the low-passed fused speed that feeds ONLY the throttle D-term
+  if (seriesVisible.dFilterSpd) plotSeries(dFilterSpeedBuf, '#f6f', 1, yv);
   // Encoder speed line (purple) — signed, so backward jitter dips below the axis and clips
-  if (seriesVisible.enc) {
-    gctx.beginPath();
-    encBuf.forEach((v, i) => {
-      const x = sl + i * step;
-      const y = h - pad - (v / maxVal) * (h - pad * 2);
-      i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
-    });
-    gctx.strokeStyle = '#a4f';
-    gctx.lineWidth = 1;
-    gctx.stroke();
-  }
-  // Speed line
+  if (seriesVisible.enc) plotSeries(encBuf, '#a4f', 1, yv);
+  // Hall speed — plot only real readings and connect them with sloped lines. hallSpeedMph holds
+  // its value between pulses, so consecutive equal samples are stale repeats: skipping them (and
+  // interpolating across the gap) avoids the artificial square-step look.
   if (seriesVisible.speed) {
-    gctx.beginPath();
-    speedBuf.forEach((v, i) => {
-      const x = sl + i * step;
-      const y = h - pad - (v / maxVal) * (h - pad*2);
-      i === 0 ? gctx.moveTo(x, y) : gctx.lineTo(x, y);
-    });
-    gctx.strokeStyle = '#4af';
-    gctx.lineWidth = 1.5;
-    gctx.stroke();
-    gctx.lineTo(sl + (HISTORY-1)*step, h-pad);
-    gctx.lineTo(sl, h-pad);
-    gctx.closePath();
-    gctx.fillStyle = 'rgba(68,170,255,0.15)';
-    gctx.fill();
+    if (_graphPointMode) {
+      gctx.fillStyle = '#4af';
+      speedBuf.forEach((v, i) => {
+        if (i > 0 && v === speedBuf[i-1]) return;  // unchanged = held/stale sample — skip
+        gctx.beginPath(); gctx.arc(sl + i * step, yv(v), 2, 0, 6.283); gctx.fill();
+      });
+    } else {
+      gctx.beginPath();
+      let prevV = null;
+      speedBuf.forEach((v, i) => {
+        if (i > 0 && v === speedBuf[i-1]) return;  // unchanged = held/stale sample — skip
+        const x = sl + i * step;
+        const y = yv(v);
+        // Break the line coming out of a stop: connect the drop into 0, but don't slope back up
+        // from a held 0 to the next reading.
+        if (prevV === null || prevV === 0) gctx.moveTo(x, y); else gctx.lineTo(x, y);
+        prevV = v;
+      });
+      gctx.strokeStyle = '#4af';
+      gctx.lineWidth = 1.5;
+      gctx.stroke();
+    }
   }
+}
+
+// Encoder raw-angle graph. Sawtooth 0–4095; the pen lifts across each wrap so the retrace
+// isn't drawn as a vertical slash.
+const angleCanvas = document.getElementById('angleGraph');
+const actx = angleCanvas.getContext('2d');
+function drawAngleGraph() {
+  const w = angleCanvas.offsetWidth || 400;
+  const h = angleCanvas.offsetHeight || 80;
+  angleCanvas.width = w; angleCanvas.height = h;
+  const pad = 4;
+  actx.clearRect(0, 0, w, h);
+  actx.strokeStyle = '#333'; actx.lineWidth = 1;
+  actx.beginPath(); actx.moveTo(pad, pad); actx.lineTo(pad, h-pad); actx.lineTo(w-pad, h-pad); actx.stroke();
+  actx.fillStyle = '#555'; actx.font = '11px monospace';
+  actx.fillText('4095', pad+2, pad+11);
+  actx.fillText('0',    pad+2, h-pad-2);
+  const sl = pad + 22, sw = w - sl - pad;
+  const step = sw / (HISTORY - 1);
+  actx.strokeStyle = '#fd4'; actx.lineWidth = 1;
+  actx.beginPath();
+  angleBuf.forEach((v, i) => {
+    const x = sl + i * step;
+    const y = h - pad - (v / 4095) * (h - pad * 2);
+    const wrap = i > 0 && Math.abs(v - angleBuf[i-1]) > 2048;  // 0/4095 seam — start a new segment
+    (i === 0 || wrap) ? actx.moveTo(x, y) : actx.lineTo(x, y);
+  });
+  actx.stroke();
+  // Total encoder count / displacement (orange) — cumulative, auto-scaled to the window on its
+  // own right axis (the unwrapped counterpart of the sawtooth: a ramp while moving, flat when still).
+  const cMin = Math.min(...encCountBuf), cMax = Math.max(...encCountBuf), cRange = Math.max(1, cMax - cMin);
+  actx.strokeStyle = '#f83'; actx.lineWidth = 1;
+  actx.beginPath();
+  encCountBuf.forEach((v, i) => {
+    const x = sl + i * step;
+    const y = h - pad - ((v - cMin) / cRange) * (h - pad * 2);
+    i === 0 ? actx.moveTo(x, y) : actx.lineTo(x, y);
+  });
+  actx.stroke();
+  actx.fillStyle = '#f83'; actx.font = '9px monospace'; actx.textAlign = 'right';
+  actx.fillText(cMax.toFixed(0), w - pad, pad + 9);
+  actx.fillText(cMin.toFixed(0), w - pad, h - pad - 2);
+  actx.textAlign = 'left';
+  // Hall-tick markers: a vertical line at each accepted pulse plus a dot where it crosses the
+  // sawtooth, so you can read the encoder angle at every valid hall tick. A bucket can hold more
+  // than one tick (buckets are <1px wide, so they can't be spread) — those get a brighter/thicker
+  // line and a white count above, so two ticks in one 20ms bucket are still visibly two.
+  hallTickBuf.forEach((n, i) => {
+    if (n <= 0) return;
+    const x = sl + i * step;
+    const multi = n >= 2;
+    actx.strokeStyle = multi ? 'rgba(120,220,255,0.9)' : 'rgba(90,200,255,0.5)';
+    actx.lineWidth = multi ? 1.5 : 1;
+    actx.beginPath(); actx.moveTo(x, pad); actx.lineTo(x, h - pad); actx.stroke();
+    const y = h - pad - (angleBuf[i] / 4095) * (h - pad * 2);
+    actx.fillStyle = '#5cf';
+    actx.beginPath(); actx.arc(x, y, 2, 0, Math.PI * 2); actx.fill();
+    if (multi) {
+      actx.fillStyle = '#fff'; actx.font = 'bold 10px monospace'; actx.textAlign = 'center';
+      actx.fillText(n, x, pad + 9);
+      actx.textAlign = 'left';
+    }
+  });
+}
+
+// Steering graph — heading error (deg, left auto-axis) vs response (right ±1 axis).
+const steerCanvas = document.getElementById('steerGraph');
+const sctx = steerCanvas.getContext('2d');
+function drawSteerGraph() {
+  const w = steerCanvas.offsetWidth || 400, h = steerCanvas.offsetHeight || 80;
+  steerCanvas.width = w; steerCanvas.height = h;
+  const pad = 4, mid = h / 2;
+  sctx.clearRect(0, 0, w, h);
+  let maxErr = 5;
+  for (const v of steerErrBuf) maxErr = Math.max(maxErr, Math.abs(v));
+  const yErr  = v => mid - (v / maxErr) * (mid - pad);
+  const yResp = v => mid - v * (mid - pad);
+  sctx.strokeStyle = '#333'; sctx.lineWidth = 1;
+  sctx.beginPath(); sctx.moveTo(pad, mid); sctx.lineTo(w - pad, mid); sctx.stroke();
+  sctx.font = '9px monospace';
+  sctx.fillStyle = '#4af'; sctx.textAlign = 'left';
+  sctx.fillText('+' + maxErr.toFixed(0) + '°', pad + 2, pad + 9);
+  sctx.fillText('-' + maxErr.toFixed(0) + '°', pad + 2, h - pad - 2);
+  sctx.fillStyle = '#fa4'; sctx.textAlign = 'right';
+  sctx.fillText('+1', w - pad, pad + 9);
+  sctx.fillText('-1', w - pad, h - pad - 2);
+  sctx.textAlign = 'left';
+  const sl = pad + 24, sw = w - sl - pad - 18, step = sw / (HISTORY - 1);
+  const plot = (buf, yfn, color) => {
+    sctx.beginPath();
+    buf.forEach((v, i) => { const x = sl + i * step, y = yfn(v); i === 0 ? sctx.moveTo(x, y) : sctx.lineTo(x, y); });
+    sctx.strokeStyle = color; sctx.lineWidth = 1; sctx.stroke();
+  };
+  plot(steerErrBuf, yErr, '#4af');
+  plot(steerRespBuf, yResp, '#fa4');
 }
 
 const canvas = document.getElementById('arrow');
@@ -824,6 +1021,7 @@ void dashboard_init() {
             else if (key == "kp")                     rtConfig.kp                     = val;
             else if (key == "ki")                     rtConfig.ki                     = val;
             else if (key == "kd")                     rtConfig.kd                     = val;
+            else if (key == "throttleDFilterAlpha")   rtConfig.throttleDFilterAlpha   = val;
             else if (key == "steeringTrim")           rtConfig.steeringTrim           = val;
             else if (key == "steeringKp")             rtConfig.steeringKp             = val;
             else if (key == "steeringKi")             rtConfig.steeringKi             = val;
@@ -835,6 +1033,9 @@ void dashboard_init() {
             else if (key == "fusedRampEndMph")        rtConfig.fusedRampEndMph        = val;
             else if (key == "fused2QSpeed")           rtConfig.fused2QSpeed           = val;
             else if (key == "fused2QBias")            rtConfig.fused2QBias            = val;
+            else if (key == "debounceSpeedFactor")    rtConfig.debounceSpeedFactor    = val;
+            else if (key == "debounceMinUs")          rtConfig.debounceMinUs          = val;
+            else if (key == "debounceMaxUs")          rtConfig.debounceMaxUs          = val;
             ESP_LOGI(TAG, "config %s = %.3f", key.c_str(), val);
         }
         req->send(200);
@@ -902,7 +1103,7 @@ void dashboard_set_perf(const PerfData& p) { _perf = p; }
 // 50 Hz control-tick samples batched into the 10 Hz WS push, so the speed graph gets
 // full PID-rate fidelity without raising the push rate (which would cost canvas
 // redraws and connection robustness). Written and drained on the loop task — no locking.
-struct CtrlSample { float hallSpeedMph, encSpeedMph, fusedSpeedMph, targetSpeedMph, throttle; };
+struct CtrlSample { float hallSpeedMph, encSpeedMph, fusedSpeedMph, fusedNoImuMph, targetSpeedMph, throttle, steering, dFilteredSpeedMph, steerErrorDeg; int encAngle, hallTicks; long encCounts; };  // encAngle, hallTicks, encCounts feed the angle graph
 static const uint8_t CTRL_RING_CAP = 12;   // 2× the nominal 5-6 samples per 100ms push
 static CtrlSample _ctrlRing[CTRL_RING_CAP];
 static uint8_t    _ctrlRingCount = 0;
@@ -914,7 +1115,14 @@ void dashboard_sample_ctrl() {
     if (_ctrlRingCount >= CTRL_RING_CAP) return;
     const ControlOutput& ctrl = control_get();
     const RPMData&       rpm  = rpm_get();
-    _ctrlRing[_ctrlRingCount++] = { rpm.hallSpeedMph, rpm.encSpeedMph, rpm.fusedSpeedMph, ctrl.targetSpeedMph, ctrl.throttle };
+    // Accepted hall pulses since the last stored sample (angle-graph markers). The delta advances
+    // only on store, so ticks during a dropped sample roll into the next one rather than vanish.
+    static unsigned long _lastHallPulses = 0;
+    static bool          _hallTickInit   = false;
+    if (!_hallTickInit) { _lastHallPulses = rpm.hallPulses; _hallTickInit = true; }
+    int hallTicks   = (int)(rpm.hallPulses - _lastHallPulses);
+    _lastHallPulses = rpm.hallPulses;
+    _ctrlRing[_ctrlRingCount++] = { rpm.hallSpeedMph, rpm.encSpeedMph, rpm.fusedSpeedMph, rpm.fusedNoImuMph, ctrl.targetSpeedMph, ctrl.throttle, ctrl.steering, ctrl.dFilteredSpeedMph, ctrl.steerErrorDeg, rpm.encAngle, hallTicks, rpm.encCounts };
 }
 
 void dashboard_update(float lps) {
@@ -932,10 +1140,15 @@ void dashboard_update(float lps) {
 
     _webSocket.cleanupClients();
 
+    // Backpressure: skip this push (don't build or queue it) if any client's async TX queue is
+    // still full from prior frames. Bounds heap and keeps the view near-real-time instead of
+    // draining a stale backlog; the ctrl ring holds its samples and coalesces into the next frame.
+    if (!_webSocket.availableForWriteAll()) return;
+
     // Drain the control-tick ring into "g" arrays (one entry per 20ms PID tick since
     // the last push). The scalar speed/throttle/tSp fields stay in the frame as the
     // instantaneous values for the stat readouts.
-    char gBuf[896];
+    static char gBuf[1600];
     int  gLen = snprintf(gBuf, sizeof(gBuf), "\"g\":{\"sp\":[");
     for (uint8_t i = 0; i < _ctrlRingCount; i++)
         gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].hallSpeedMph));
@@ -945,29 +1158,51 @@ void dashboard_update(float lps) {
     gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"f2\":[");
     for (uint8_t i = 0; i < _ctrlRingCount; i++)
         gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].fusedSpeedMph));
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"f2n\":[");  // fused KF without IMU predict (bench diagnostic)
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].fusedNoImuMph));
     gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"tsp\":[");
     for (uint8_t i = 0; i < _ctrlRingCount; i++)
         gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].targetSpeedMph));
     gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"th\":[");
     for (uint8_t i = 0; i < _ctrlRingCount; i++)
         gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].throttle));
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"an\":[");  // encoder raw angle (angle graph)
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%d", i ? "," : "", _ctrlRing[i].encAngle);
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"hp\":[");  // accepted hall ticks/sample (angle graph markers)
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%d", i ? "," : "", _ctrlRing[i].hallTicks);
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"cn\":[");  // encoder total count / displacement (angle graph)
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%ld", i ? "," : "", _ctrlRing[i].encCounts);
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"dS\":[");  // D-term low-passed speed (speed graph)
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].dFilteredSpeedMph));
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"sErr\":[");  // steering heading error deg (steering graph)
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.1f", i ? "," : "", safeF(_ctrlRing[i].steerErrorDeg));
+    gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "],\"sResp\":[");  // steering response (steering graph)
+    for (uint8_t i = 0; i < _ctrlRingCount; i++)
+        gLen += snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "%s%.3f", i ? "," : "", safeF(_ctrlRing[i].steering));
     snprintf(gBuf + gLen, sizeof(gBuf) - gLen, "]}");
     _ctrlRingCount = 0;
 
-    char buf[2048];
+    static char buf[3072];
     snprintf(buf, sizeof(buf),
         "{\"dist\":%.1f,\"angle\":%.1f,\"setpointHeading\":%.1f,\"navState\":\"%s\",\"odometry\":%.0f,"
         "\"uwbQ\":%d,"
         "\"speed\":%.3f,\"fSp\":%.3f,\"hRaw\":%.3f,\"cogging\":%d,\"signChanges\":%d,"
         "\"heading\":%.1f,\"cal_rot\":%u,\"cal_acc\":%u,"
         "\"throttle\":%.3f,\"steering\":%.3f,\"tSp\":%.3f,\"lps\":%.0f,"
+        "\"escPwm\":%d,\"steerPwm\":%d,\"panPwm\":%d,"
         "%s,"
         "\"cfg\":{\"ts\":%.3f,\"sa\":%.3f,\"fd\":%.0f,\"md\":%.0f,\"mnSp\":%.2f,\"mxSp\":%.2f,"
-        "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,"
+        "\"kp\":%.3f,\"ki\":%.3f,\"kd\":%.3f,\"dFil\":%.2f,"
         "\"sTr\":%.3f,\"sKp\":%.4f,\"sKi\":%.4f,\"sMax\":%.3f,"
         "\"uOr\":%.1f,"
         "\"fER\":%.4g,\"fHR\":%.4g,\"fRs\":%.2f,\"fRe\":%.2f,"
-        "\"f2Qs\":%.4g,\"f2Qb\":%.4g},"
+        "\"f2Qs\":%.4g,\"f2Qb\":%.4g,\"dbF\":%.2f,\"dbMn\":%.0f,\"dbMx\":%.0f},"
         "\"perf\":{\"ia\":%u,\"im\":%u,\"ua\":%u,\"um\":%u,"
         "\"ca\":%u,\"cm\":%u,\"oa\":%u,\"om\":%u,\"wa\":%u,\"wm\":%u}}",
         safeF(uwb.distCm), safeF(uwb.angleDeg), safeF(control_setpoint_heading_deg()),
@@ -979,16 +1214,18 @@ void dashboard_update(float lps) {
         safeF(rpm.hallSpeedMph), safeF(rpm.fusedSpeedMph), safeF(rpm.hallRawMph), (int)rpm.cogging, rpm.signChanges,
         safeF(imu.yaw), imu.cal_rot, imu.cal_accel,
         safeF(ctrl.throttle), safeF(ctrl.steering), safeF(ctrl.targetSpeedMph), safeF(lps),
+        actuators_get_esc_pwm(), actuators_get_steer_pwm(), pan_get_pwm(),
         gBuf,
         rtConfig.throttleScale, rtConfig.smoothAlpha,
         rtConfig.followDistanceCm, rtConfig.maxDistanceCm,
         rtConfig.minSpeedMph, rtConfig.maxSpeedMph,
-        rtConfig.kp, rtConfig.ki, rtConfig.kd,
+        rtConfig.kp, rtConfig.ki, rtConfig.kd, rtConfig.throttleDFilterAlpha,
         rtConfig.steeringTrim, rtConfig.steeringKp, rtConfig.steeringKi, rtConfig.steeringMax,
         rtConfig.uwbOutlierRejectCm,
         rtConfig.fusedEncR, rtConfig.fusedHallR,
         rtConfig.fusedRampStartMph, rtConfig.fusedRampEndMph,
         rtConfig.fused2QSpeed, rtConfig.fused2QBias,
+        rtConfig.debounceSpeedFactor, rtConfig.debounceMinUs, rtConfig.debounceMaxUs,
         _perf.imuAvg,  _perf.imuMax,
         _perf.uwbAvg,  _perf.uwbMax,
         _perf.ctrlAvg, _perf.ctrlMax,

@@ -6,14 +6,22 @@
 #include "imu.h"
 #include "rpm.h"
 #include "pan.h"
+#include "actuators.h"
 #include "control.h"
 #include "utils.h"
 #include "runtime_config.h"
+#include "log_event.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
 
-static RateGate _gate{20};  // 50 Hz
+static RateGate _gate{20};          // 50 Hz telemetry
+static RateGate _healthGate{1000};  // 1 Hz sensor-health frames
+
+// Loop/UWB/encoder update rates (Hz) and worst loop-gap (µs) published by main each loop,
+// reused for the health frame; IMU and hall rates are read live from their own modules at emit
+// time. maxLoopUs is a running max across health-frame intervals (reset on emit, not per loop).
+static struct { float loopHz, uwbHz, encHz; uint32_t maxLoopUs; } _healthData = { 0.0f, 0.0f, 0.0f, 0 };
 
 // Latest validated command frames; timestamps stay 0 until the first valid frame of
 // each shape arrives.
@@ -33,6 +41,35 @@ static bool   _rxOverflow = false;  // discarding until the next '\n' after buff
 // Returns the latest validated command frame from the Pi.
 const CommandData& serial_hal_get() { return _cmdData; }
 
+// Caches main's loop/UWB/encoder rate counters and folds the loop-gap into a running max for
+// the next health frame. maxLoopUs arrives as main's window running-max; taking the max of what
+// we see between emits captures the peak even across main's per-window reset.
+void serial_hal_set_health_rates(float loopHz, float uwbHz, float encHz, uint32_t maxLoopUs) {
+    _healthData.loopHz = loopHz;
+    _healthData.uwbHz  = uwbHz;
+    _healthData.encHz  = encHz;
+    if (maxLoopUs > _healthData.maxLoopUs) _healthData.maxLoopUs = maxLoopUs;
+}
+
+// Emits one sensor-health frame: measured update rates in Hz (0 = silent/dead). Built as a
+// single whole line and dropped wholesale if the TX buffer can't hold it, so it never blocks
+// or tears a telemetry frame. Loop task only — shares the telemetry TX owner.
+static void emit_health_frame() {
+    const ImuData& imu = imu_get();
+    const RPMData& rpm = rpm_get();
+    char line[192];
+    int n = snprintf(line, sizeof(line),
+        "{\"type\":\"health\",\"max_loop_us\":%lu,\"sensors\":{"
+        "\"imu\":%.1f,\"uwb\":%.1f,\"enc\":%.1f,\"hall\":%.1f,\"loop\":%.1f}}\n",
+        (unsigned long)_healthData.maxLoopUs,
+        (float)imu.update_hz, _healthData.uwbHz, _healthData.encHz, rpm.hallHz, _healthData.loopHz);
+    if (n <= 0) return;
+    size_t len = (n < (int)sizeof(line)) ? (size_t)n : sizeof(line) - 1;
+    if (Serial.availableForWrite() < (int)len) return;  // full TX buffer: drop, never block (max keeps accumulating)
+    Serial.write((const uint8_t*)line, len);
+    _healthData.maxLoopUs = 0;  // reset only after a frame actually goes out, so a dropped frame doesn't lose the peak
+}
+
 // Dashboard bench-test injection: stores a synthetic DIRECT frame exactly as if the
 // Pi had sent it — same slot, same ranges as process_direct_frame, same lastDirectMs
 // stamp feeding the cmd-timeout failsafe. If the Pi is streaming DIRECT frames at the
@@ -43,6 +80,7 @@ void serial_hal_inject_direct(float throttle, float steering, float panDeg) {
     _cmdData.directSteering = constrain(steering, -1.0f, 1.0f);
     _cmdData.targetPanDeg   = constrain(panDeg, -90.0f, 90.0f);  // same bound as the Pi's target_pan validation
     _cmdData.lastDirectMs   = millis();
+    control_set_mode(ControlMode::DIRECT);  // auto-switch on shape, same as a Pi DIRECT frame (ignored if STOPPED-latched)
 }
 
 // Dashboard bench-test injection for SETPOINT: stores a synthetic setpoint frame —
@@ -56,6 +94,7 @@ void serial_hal_inject_setpoint(float speedMph, float headingDeg) {
     _cmdData.targetSpeedMph   = constrain(speedMph, 0.0f, rtConfig.maxSpeedMph);
     _cmdData.targetHeadingDeg = headingDeg;
     _cmdData.lastCmdMs        = millis();
+    control_set_mode(ControlMode::SETPOINT);  // auto-switch on shape, same as a Pi SETPOINT frame (ignored if STOPPED-latched)
 }
 
 // Extracts the float following "key": in a JSON line; false if the key is absent or the number is malformed.
@@ -139,7 +178,17 @@ static void process_command_line(const char* line) {
         else                                      _cmdRejects++;
     }
 
+    // Auto-switch control mode to match an accepted command's shape: a valid SETPOINT frame
+    // selects SETPOINT, a valid DIRECT frame selects DIRECT — detected by which command
+    // timestamp the frame advanced. STOPPED is latching (control_set_mode ignores the request),
+    // so a command can never auto-escape the safety stop. Acted on at the next control tick.
+    uint32_t prevCmdMs    = _cmdData.lastCmdMs;
+    uint32_t prevDirectMs = _cmdData.lastDirectMs;
+
     if (!process_setpoint_frame(line)) process_direct_frame(line);
+
+    if      (_cmdData.lastCmdMs    != prevCmdMs)    control_set_mode(ControlMode::SETPOINT);
+    else if (_cmdData.lastDirectMs != prevDirectMs) control_set_mode(ControlMode::DIRECT);
 }
 
 // Drains all pending RX bytes into the line buffer, non-blocking; processes a frame per '\n'.
@@ -171,9 +220,32 @@ static void serial_rx_drain() {
 // Serial already opened by main.cpp setup(); nothing to do here.
 void serial_hal_init() {}
 
+// Substitutes 0 for a non-finite telemetry value (NaN/Inf), so a bad sensor reading can never
+// reach the wire — interface.md Wire Rule #1 (a non-numeric numeric field crashes the bridge).
+static float finite_or_zero(float v, bool* scrubbed) {
+    if (isfinite(v)) return v;
+    *scrubbed = true;
+    return 0.0f;
+}
+
 // Drains inbound command bytes every call, then emits one JSON telemetry frame if the 20 ms gate has elapsed.
 void serial_hal_update() {
     serial_rx_drain();
+
+    // Surface command-validation rejects as an event. The cmd_rejects counter carries the
+    // running total in telemetry; this adds a human-visible heads-up, throttled to at most
+    // once per 3s while the count moves so a 20 Hz stream of bad frames can't flood.
+    static uint32_t _rejectsSeen = 0;
+    if (_cmdRejects != _rejectsSeen) {
+        _rejectsSeen = _cmdRejects;
+        log_event_throttled("cmd_reject", LOG_WARN, 3000, "command rejected (%lu total)", (unsigned long)_cmdRejects);
+    }
+
+#ifndef SERIAL_HAL_TX_DISABLED
+    // Sensor-health frames on their own 1 Hz gate, independent of the 50 Hz telemetry gate below.
+    float hdt;
+    if (_healthGate.tick(hdt)) emit_health_frame();
+#endif
 
     float dt;
     if (!_gate.tick(dt)) return;
@@ -196,22 +268,42 @@ void serial_hal_update() {
     // boot) to tell fresh bearings from stale ones.
     long uwbAge = uwb.timestamp == 0 ? -1 : (long)(millis() - uwb.timestamp);
 
-    Serial.printf(
+    // Every float field is passed through finite_or_zero: a NaN/Inf from a faulting sensor or a
+    // diverged filter is replaced with 0 rather than printed as "nan"/"inf" (int fields and the
+    // -1 sentinels can't go non-finite). scrubbed flags whether any substitution happened.
+    // Built into a buffer then dropped wholesale if the USB-CDC TX buffer can't hold the whole
+    // frame, so a Pi reading in bursts back-pressures into a dropped frame rather than a blocking
+    // Serial write that stalls the loop task (the Pi keys off ts/cmd_age and tolerates gaps).
+    bool scrubbed = false;
+    char frame[640];
+    int n = snprintf(frame, sizeof(frame),
         "{\"ts\":%lu"
         ",\"uwb_dist\":%.1f,\"uwb_bearing\":%.2f,\"uwb_age\":%ld"
         ",\"yaw\":%.2f,\"yaw_rate\":%.2f,\"pitch\":%.2f,\"roll\":%.2f,\"lax\":%.3f"
-        ",\"speed\":%.3f,\"odo\":%.1f,\"cogging\":%d"
+        ",\"speed\":%.3f,\"odo\":%.1f,\"cogging\":%d,\"enc_fault\":%d"
         ",\"mode\":\"%s\""
         ",\"cmd_speed\":%.2f,\"cmd_heading\":%.1f,\"cmd_pan\":%.1f,\"cmd_age\":%ld,\"cmd_rejects\":%lu"
         ",\"throttle\":%.3f,\"steering\":%.3f"
+        ",\"esc_pwm\":%d,\"steer_pwm\":%d,\"pan_pwm\":%d"
         ",\"pan_angle\":%.2f"
         "}\n",
         millis(),
-        uwb.distCm, uwb.angleDeg, uwbAge,
-        imu.yaw, imu.yawRate, imu.pitch, imu.roll, imu.lax,
-        rpm.fusedSpeedMph, rpm.odometryCm, (int)rpm.cogging,
+        finite_or_zero(uwb.distCm, &scrubbed), finite_or_zero(uwb.angleDeg, &scrubbed), uwbAge,
+        finite_or_zero(imu.yaw, &scrubbed), finite_or_zero(imu.yawRate, &scrubbed), finite_or_zero(imu.pitch, &scrubbed), finite_or_zero(imu.roll, &scrubbed), finite_or_zero(imu.lax, &scrubbed),
+        finite_or_zero(rpm.fusedSpeedMph, &scrubbed), finite_or_zero(rpm.odometryCm, &scrubbed), (int)rpm.cogging, (int)!rpm.encoderHealthy,
         control_mode_str(control_mode()),
-        _cmdData.targetSpeedMph, _cmdData.targetHeadingDeg, _cmdData.targetPanDeg, cmdAge, (unsigned long)_cmdRejects,
-        ctrl.throttle, ctrl.steering,
-        pan_get_angle());
+        finite_or_zero(_cmdData.targetSpeedMph, &scrubbed), finite_or_zero(_cmdData.targetHeadingDeg, &scrubbed), finite_or_zero(_cmdData.targetPanDeg, &scrubbed), cmdAge, (unsigned long)_cmdRejects,
+        finite_or_zero(ctrl.throttle, &scrubbed), finite_or_zero(ctrl.steering, &scrubbed),
+        actuators_get_esc_pwm(), actuators_get_steer_pwm(), pan_get_pwm(),
+        finite_or_zero(pan_get_angle(), &scrubbed));
+    if (n > 0) {
+        size_t len = (n < (int)sizeof(frame)) ? (size_t)n : sizeof(frame) - 1;
+        if (Serial.availableForWrite() >= (int)len)  // full TX buffer: drop this frame, never block
+            Serial.write((const uint8_t*)frame, len);
+    }
+
+    // Substituting silently would hide a real sensor/filter fault behind plausible zeros, so warn
+    // the Pi (throttled to 3s) that at least one field was scrubbed this frame.
+    if (scrubbed)
+        log_event_throttled("telem_nan", LOG_WARN, 3000, "non-finite telemetry field scrubbed to 0");
 }

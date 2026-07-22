@@ -9,3 +9,7 @@ void actuators_init();
 
 // Accepts [-1, 1] throttle and steering, applies all hardware transforms, and writes to servos.
 void actuators_set(float throttle, float steering);
+
+// Last PWM µs written to the ESC (throttle) and steering servo — post deadband/scale/smoothing.
+int actuators_get_esc_pwm();
+int actuators_get_steer_pwm();

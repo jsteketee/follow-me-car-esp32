@@ -2,6 +2,7 @@
 #include "imu.h"
 #include "config.h"
 #include "utils.h"
+#include "log_event.h"
 #include <Adafruit_BNO08x.h>
 #include <math.h>
 #include "esp_log.h"
@@ -49,6 +50,7 @@ void imu_init()
         if (attempt >= 5) {
             Serial.printf("[%s] ❌ BNO085 not found after %d attempts — will keep retrying from imu_update\n",
                           TAG, attempt);
+            log_event(LOG_ERROR, "IMU not found — retrying");
             return;
         }
         Serial.printf("[%s] ⚠️ BNO085 begin failed (attempt %d/5) — retrying\n", TAG, attempt);
@@ -82,6 +84,7 @@ void imu_init()
     bno.wasReset();
     imu_ready = true;
     Serial.printf("[%s] ⚠️ BNO085 init timeout — no rotation vector in 3s, yaw will be invalid\n", TAG);
+    log_event(LOG_WARN, "IMU init timeout — yaw invalid");
 }
 
 // Need to figure this out.
@@ -110,6 +113,18 @@ void imu_update()
     {
         ESP_LOGW(TAG, "⚠️ BNO085 reset, re-enabling reports");
         enableReports();
+    }
+
+    // Stall reporting, decoupled from the reinit recovery below: flag a rotation-vector
+    // dropout far sooner (IMU_STALL_WARN_MS) than the 1s reinit, emitting once on entry
+    // and once on recovery. The threshold sits above the ~300ms WiFi-burst loop stall so
+    // a stalled loop (timestamp goes stale without the sensor dying) isn't misreported.
+    static bool _imuStalled = false;
+    if (_imuData.timestamp != 0) {
+        bool stalled = (millis() - _imuData.timestamp) > IMU_STALL_WARN_MS;
+        if (stalled && !_imuStalled)      log_event(LOG_ERROR, "IMU stream stalled");
+        else if (!stalled && _imuStalled) log_event(LOG_WARN,  "IMU stream recovered");
+        _imuStalled = stalled;
     }
 
     // Dead-stream recovery: reports stopped for >1s with no reset event — the SH-2

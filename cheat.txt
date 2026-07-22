@@ -1,6 +1,7 @@
 ## Build & Flash
 pio run -e car --target upload                              # main build, upload over USB
-pio run -e car --target upload --upload-port 192.168.4.1   # upload over WiFi (car must be on)
+pio run -e car --target upload --upload-port followme.local # upload over WiFi in STA mode (OLED shows WIFI-J); or use the car's DHCP IP
+pio run -e car --target upload --upload-port 192.168.4.1    # upload over WiFi ONLY in AP-fallback (OLED shows WIFI-H, car hosting "Follow Me")
 pio run -e test --target upload                             # info-level logging
 pio run -e debug --target upload                            # debug-level logging
 pio run -e no-camera --target upload                        # disable camera module
@@ -11,10 +12,19 @@ pio run -e as5600-test --target upload                      # standalone AS5600 
 ## Monitor
 pio device monitor                                          # USB serial monitor
 sleep 2 && pio device monitor                               # wait for reboot then monitor
+pio device monitor --port socket://followme.local:23        # monitor over WiFi (same pio monitor UX, no USB)
 
 ## WiFi / Network
-stty raw -echo && nc 192.168.4.1 23; stty -raw echo         # telnet terminal over car WiFi
-# Dashboard: WiFi "Follow Me" (no password) → http://192.168.4.1/
+# OLED WiFi flag: WIFI-J = Joined a network (STA) → reach via followme.local / its DHCP IP
+#                 WIFI-H = Hosting fallback AP "Follow Me" → reach via 192.168.4.1
+# 192.168.4.1 exists ONLY in AP-fallback mode; in STA mode the car has a DHCP IP — find it:
+dscacheutil -q host -a name followme.local                 # resolve car's STA IP via mDNS
+ping -c1 followme.local                                     # confirm reachable + show IP
+nc -uz -w2 followme.local 3232                              # check OTA (espota) port is listening
+stty raw -echo && nc followme.local 23; stty -raw echo      # telnet terminal over WiFi (STA / WIFI-J)
+stty raw -echo && nc 192.168.4.1 23; stty -raw echo         # telnet terminal in AP-fallback (WIFI-H)
+# Dashboard: STA → http://followme.local/ (or DHCP IP);  AP-fallback → http://192.168.4.1/
+# OTA "No response from ESP": wrong address (AP IP while in STA), or macOS firewall blocking the ESP's callback
 
 ## Python Tools
 python3 scripts/rpm_plot.py                                 # live RPM sensor fusion plot — encoder, hall-effect, combined (USB serial)

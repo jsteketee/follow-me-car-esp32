@@ -12,6 +12,7 @@
 #include "config.h"
 #include "uwb.h"
 #include "utils.h"
+#include "log_event.h"
 #include <Arduino.h>
 
 static const char* TAG = "pan";
@@ -50,6 +51,9 @@ static float pan_us_to_deg(int us) {
 // Current commanded pan angle in degrees.
 float pan_get_angle() { return pan_us_to_deg(_panUs); }
 
+// Last PWM µs written to the pan servo.
+int pan_get_pwm() { return _panUs; }
+
 static RateGate _panTrackGate{ 20 };
 
 // Slews toward the Pi-commanded target at PAN_SLEW_DEG_PER_S so pan_get_angle stays
@@ -73,6 +77,7 @@ void pan_init() {
     _panAttached = ledcAttach(PIN_SERVO_UWB, PAN_LEDC_FREQ_HZ, PAN_LEDC_RES_BITS);
     if (!_panAttached) {
         Serial.printf("[%s] ❌ ledcAttach FAILED on pin %d\n", TAG, PIN_SERVO_UWB);
+        log_event(LOG_ERROR, "pan servo attach failed");
         return;
     }
     pan_write_us(pan_center_us());

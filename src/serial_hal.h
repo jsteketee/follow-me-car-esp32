@@ -24,6 +24,11 @@ void               serial_hal_init();
 void               serial_hal_update();
 const CommandData& serial_hal_get();
 
+// Publishes main's live loop/UWB/encoder rate counters and worst loop-gap (µs) for the 1 Hz
+// sensor-health frame; IMU and hall rates are read from their own modules. maxLoopUs accumulates
+// as a running max here and resets when a health frame is sent. Call each loop before serial_hal_update().
+void serial_hal_set_health_rates(float loopHz, float uwbHz, float encHz, uint32_t maxLoopUs);
+
 // Dashboard bench-test paths: write a synthetic frame into the same slot Pi frames
 // land in, so control's mode paths, the cmd-timeout failsafes, and main's pan routing
 // apply unchanged. inject_direct carries raw efforts (throttle [-1,1], steering

@@ -10,6 +10,7 @@ RuntimeConfig rtConfig = {
     .kp                     = THROTTLE_PID_KP,
     .ki                     = THROTTLE_PID_KI,
     .kd                     = THROTTLE_PID_KD,
+    .throttleDFilterAlpha   = THROTTLE_D_FILTER_ALPHA,
     .smoothAlpha            = THROTTLE_SMOOTH_ALPHA,
     .steeringTrim           = STEERING_TRIM,
     .steeringKp             = STEERING_PID_KP,
@@ -22,4 +23,7 @@ RuntimeConfig rtConfig = {
     .fusedRampEndMph        = RPM_FUSED_ENC_RAMP_END_MPH,
     .fused2QSpeed           = RPM_FUSED2_Q_SPEED,
     .fused2QBias            = RPM_FUSED2_Q_BIAS,
+    .debounceSpeedFactor    = RPM_DEBOUNCE_SPEED_FACTOR,
+    .debounceMinUs          = RPM_DEBOUNCE_MIN_US,
+    .debounceMaxUs          = RPM_DEBOUNCE_MAX_US,
 };

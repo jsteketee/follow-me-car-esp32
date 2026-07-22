@@ -62,7 +62,10 @@ static void perf_report() {
     uint32_t oledTaskAvg, oledTaskMax;
     oled_render_perf(oledTaskAvg, oledTaskMax);
 
-    Serial.printf(
+    // Both perf lines go through the same drop-if-TX-full guard as the telemetry frames: a Pi
+    // reading USB-CDC in bursts must never block these raw Serial writes into a loop-task stall.
+    char pbuf[360];
+    int pn = snprintf(pbuf, sizeof(pbuf),
         "[loop perf] lps=%.0f"
         "  maxLoop=%u"
         "  imu=%u/%u"
@@ -86,10 +89,19 @@ static void perf_report() {
         perfRpm.avg(),    perfRpm.maxUs,
         perfDash.avg(),   perfDash.maxUs,
         perfSerial.avg(), perfSerial.maxUs);
+    if (pn > 0) {
+        size_t plen = (pn < (int)sizeof(pbuf)) ? (size_t)pn : sizeof(pbuf) - 1;
+        if (Serial.availableForWrite() >= (int)plen) Serial.write((const uint8_t*)pbuf, plen);
+    }
 
-    Serial.printf(
+    char sbuf[128];
+    int sn = snprintf(sbuf, sizeof(sbuf),
         "[sensor perf] imu=%.0fHz  uwb=%.0fHz  enc=%.0fHz  hall=%.0fHz\n",
         (float)imu.update_hz, hzUwb.hz, hzEnc.hz, rpm_get().hallHz);
+    if (sn > 0) {
+        size_t slen = (sn < (int)sizeof(sbuf)) ? (size_t)sn : sizeof(sbuf) - 1;
+        if (Serial.availableForWrite() >= (int)slen) Serial.write((const uint8_t*)sbuf, slen);
+    }
 
     dashboard_set_perf({ perfImu.avg(),    perfImu.maxUs,
                          perfUwb.avg(),    perfUwb.maxUs,
@@ -103,6 +115,10 @@ static void perf_report() {
 void setup()
 {
     delay(3000);
+    // Must precede begin(): HWCDC creates the TX ring at 256 B if not preset, which is smaller
+    // than one ~400 B telemetry frame — the availableForWrite() drop-guard would then reject
+    // every frame. 512 holds one frame with margin, biasing toward fresh-drop over buffering.
+    Serial.setTxBufferSize(512);
     Serial.begin(115200);
     Serial.println("⭐⭐⭐⭐⭐ Setting Up ⭐⭐⭐⭐⭐");
 
@@ -151,6 +167,7 @@ void loop()
     perfWifi.begin();   wifi_update();                            perfWifi.end();
     perfRpm.begin();    hzEnc.update(rpm_update(imu_get().lax));  perfRpm.end();
     perfDash.begin();   dashboard_update(loopHz.hz);              perfDash.end();
+    serial_hal_set_health_rates(loopHz.hz, hzUwb.hz, hzEnc.hz, maxLoopGapUs);  // publish rate counters + worst loop gap for the 1 Hz health frame
     perfSerial.begin(); serial_hal_update();                      perfSerial.end();
     perf_report();
 }

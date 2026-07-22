@@ -14,6 +14,7 @@ struct RuntimeConfig {
     float kp;
     float ki;
     float kd;
+    float throttleDFilterAlpha;
     float smoothAlpha;
     // Steering
     float steeringTrim;
@@ -29,6 +30,10 @@ struct RuntimeConfig {
     float fusedRampEndMph;
     float fused2QSpeed;
     float fused2QBias;
+    // Hall debounce — speed-adaptive ISR quiet-gap window
+    float debounceSpeedFactor;
+    float debounceMinUs;
+    float debounceMaxUs;
 };
 
 extern RuntimeConfig rtConfig;

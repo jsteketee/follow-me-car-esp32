@@ -7,6 +7,7 @@
 void  pan_init();                    // attach the servo and move to trimmed center
 void  pan_update(float targetDeg);   // call each loop with the CommandData pan target: 20ms-gated slew toward it
 float pan_get_angle();               // current commanded pan angle in degrees (slew-limited, so honest during moves)
+int   pan_get_pwm();                 // last PWM µs written to the pan servo
 
 #ifdef PAN_CAL_TEST
 // Blocking bench calibration (~40s): mechanical sweep, then a five-point UWB-referenced

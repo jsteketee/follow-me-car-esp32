@@ -88,15 +88,17 @@ struct PidController {
     float kp = 0, ki = 0, kd = 0;
     float outMin = -1.0f, outMax = 1.0f;
     float integral   = 0;
-    float lastMeasure = 0;
+    float lastDMeasure = 0;   // previous D-term input, differentiated below
     bool  initialized = false;
 
-    float update(float setpoint, float measure, float dt) {
-        if (!initialized) { lastMeasure = measure; initialized = true; }
+    // `measure` feeds P and I; `dMeasure` feeds ONLY the D-term — the caller pre-filters it
+    // (e.g. a low-passed speed) so the derivative can be smoothed without lagging P/I.
+    float update(float setpoint, float measure, float dMeasure, float dt) {
+        if (!initialized) { lastDMeasure = dMeasure; initialized = true; }
         if (dt > 0.1f) dt = 0.1f;  // clamp first-tick blowup when RateGate _lastMs starts at 0
-        float error = setpoint - measure;
-        float derivative = -(measure - lastMeasure) / dt;
-        lastMeasure = measure;
+        float error = setpoint - measure;              // P and I act on the raw measurement
+        float derivative = -(dMeasure - lastDMeasure) / dt;
+        lastDMeasure = dMeasure;
         // Trial-integrate, then keep the new integral only if the resulting output is
         // in range or the error opposes the saturation direction. The ±1 clamp stays
         // as a backstop bounding the integral's output authority to ±ki.
@@ -108,7 +110,7 @@ struct PidController {
         return out;
     }
 
-    void reset() { integral = 0; lastMeasure = 0; initialized = false; }
+    void reset() { integral = 0; lastDMeasure = 0; initialized = false; }
 };
 
 // Tracks how often update() is called and exposes the rate in hz.

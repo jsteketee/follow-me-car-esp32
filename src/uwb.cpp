@@ -7,6 +7,7 @@
 #include "config.h"
 #include "runtime_config.h"
 #include "utils.h"
+#include "log_event.h"
 #include "esp_log.h"
 #include <math.h>
 
@@ -73,7 +74,6 @@ static void on_frame() {
         _uwbData.angleDeg  = angleDeg;
         _uwbData.distCm    = distCm;
         _uwbData.timestamp = millis();
-        ESP_LOGD(TAG, "angle=%.1f°  dist=%.0fcm", angleDeg, distCm);
     }
 }
 
@@ -139,6 +139,7 @@ void uwb_init() {
         Serial.printf("[%s] ✅ DW3000 ready  angle=%.1f°  dist=%.0fcm\n", TAG, _uwbData.angleDeg, _uwbData.distCm);
     } else {
         Serial.printf("[%s] ❌ DW3000 no frames in 2s — check wiring (RX=GPIO%d TX=GPIO%d)\n", TAG, PIN_DW3000_RX, PIN_DW3000_TX);
+        log_event(LOG_ERROR, "UWB no frames — check wiring");
     }
 }
 

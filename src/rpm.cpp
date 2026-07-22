@@ -1,10 +1,11 @@
-// RPM driver: hall-effect interrupt for speed and odometry; AS5600 encoder for cogging detection.
-// Hall-effect is the source of truth for speed and odometry. The encoder's high-resolution
-// angle data detects motor cogging — oscillation at a reluctance point without net forward motion.
+// RPM driver: hall-effect interrupt for speed; AS5600 encoder for odometry and cogging detection.
+// Hall-effect is the source of truth for speed. The AS5600 encoder is the source of truth for
+// odometry (signed, high-res) and detects motor cogging — oscillation at a reluctance point.
 #include "rpm.h"
 #include "config.h"
 #include "runtime_config.h"
 #include "utils.h"
+#include "log_event.h"
 #include "esp_log.h"
 #include <Arduino.h>
 #include <Wire.h>
@@ -14,21 +15,30 @@ static const char* TAG = "rpm";
 // =============================================================================
 // Hall-effect sensor (speed + odometry)
 // =============================================================================
-static volatile uint32_t _hallLastPulseUs = 0;
+static volatile uint32_t _hallLastPulseUs = 0;   // last ACCEPTED pulse — speed period is measured from this
+static volatile uint32_t _hallLastEdgeUs  = 0;   // last edge of ANY kind — re-arms the debounce quiet-gap timer
+static volatile uint32_t _hallDebounceUs  = RPM_DEBOUNCE_MAX_US; // speed-adaptive quiet-gap window (µs), sized by the main loop
 static volatile uint32_t _hallPeriodUs    = 0;
 static volatile uint32_t _hallPulseCount  = 0;
 static volatile bool     _hallPulseValid  = false;
-static float             _hallEmaSpeed    = 0.0f;
-static int               _hallSpikeStreak = 0;
 static uint32_t          _hallLastCountTracked = 0; // pulse count snapshot for odometry
 static HzTracker         _hallHz;                   // pulse arrival rate — 0 at standstill, scales with wheel speed
+static uint32_t          _hallAccelLastUs  = 0;     // time + speed of the last accel-accepted reading (plausibility gate)
+static float             _hallAccelLastMph = 0.0f;
 
-// ISR — records inter-pulse period and increments pulse counter.
+// ISR — debounces, records inter-pulse period, and increments pulse counter.
 static void IRAM_ATTR on_hall_pulse() {
-    uint32_t now = micros();
-    if (_hallPulseValid) {
-        _hallPeriodUs = now - _hallLastPulseUs;
-    }
+    uint32_t now       = micros();
+    uint32_t sinceEdge = now - _hallLastEdgeUs;
+    _hallLastEdgeUs    = now;  // every edge re-arms the quiet-gap timer, accepted or not
+    // A real magnet pass is an isolated edge preceded by a long quiet gap. Reject any edge that
+    // follows another within the debounce window — measured from the last EDGE, not the last
+    // accepted pulse, so sustained chatter yields zero pulses (a last-accepted debounce would
+    // instead admit one edge per window: a steady phantom pulse train). The window is speed-
+    // adaptive (_hallDebounceUs, sized by the main loop from fused speed): wide when slow so a
+    // fast repeat is confidently a bounce, tight when fast so the next real pulse is never dropped.
+    if (_hallPulseValid && sinceEdge < _hallDebounceUs) return;
+    if (_hallPulseValid) _hallPeriodUs = now - _hallLastPulseUs;
     _hallLastPulseUs = now;
     _hallPulseValid  = true;
     _hallPulseCount++;
@@ -47,6 +57,7 @@ static int      _encLastAngle      = -1;    // -1 = not yet seeded
 static float    _encEmaVelocityMph = 0.0f;  // EMA of signed encoder velocity (forward = positive)
 static AngleKalman  _fused2Kf;              // 2-state fused speed [speed, accelBias] — same struct as the heading filter, speed domain
                                             // (retired 1-D encoder KF + 1-D fusion archived in test/rpm_testing.cpp)
+static AngleKalman  _fused2KfNoImu;         // same filter, same encoder+hall corrections, but predicted with 0 accel (no IMU) — bench diagnostic
 static RateGate     _fused2PredictGate{ 20 };  // predict cadence matched to the 50 Hz linear-accel report
 
 // Speed-ramped encoder R for the fused filter; NAN past the ramp end = skip the update
@@ -108,6 +119,14 @@ static void check_magnet_status() {
     if      (!md) ESP_LOGW(TAG, "⚠️ AS5600 no magnet detected");
     else if (ml)  ESP_LOGW(TAG, "⚠️ AS5600 magnet too weak — move magnet closer");
     else if (mh)  ESP_LOGW(TAG, "⚠️ AS5600 magnet too strong — move magnet farther");
+}
+
+// Reads the STATUS MD bit; returns 1 if a magnet is detected, 0 if not, -1 on I2C error.
+static int read_magnet_detected() {
+    Wire.beginTransmission(AS5600_ADDR);
+    Wire.write(REG_STATUS);
+    if (Wire.endTransmission(false) != 0 || Wire.requestFrom(AS5600_ADDR, (uint8_t)1) != 1) return -1;
+    return (Wire.read() & (1 << 5)) ? 1 : 0;
 }
 
 // Logs a MON line (status flags, AGC, magnitude, raw angle) at a fixed 0.25s rate, for bench monitoring.
@@ -177,8 +196,21 @@ static bool update_encoder() {
 
     int angle = read_encoder_angle();
     if (angle < 0) {
+        _rpmData.encoderHealthy = false; // I2C unreachable — phantom-odom gate can't corroborate
         ESP_LOGW(TAG, "⚠️ AS5600 read failed");
         return false;
+    }
+    _rpmData.encAngle = angle;  // raw angle for the dashboard angle graph
+
+    // Refresh encoder health at ~4 Hz: I2C just succeeded (angle read above), so health tracks
+    // magnet presence. A lost magnet reads a stuck angle that looks "still" and would let the
+    // phantom-odom gate veto real travel — dropping health here deactivates that gate instead.
+    static uint32_t _lastHealthMs = 0;
+    uint32_t nowHealth = millis();
+    if (nowHealth - _lastHealthMs >= 250) {
+        _lastHealthMs = nowHealth;
+        int md = read_magnet_detected();
+        if (md >= 0) _rpmData.encoderHealthy = (md == 1);
     }
 
     if (_encLastAngle < 0) {
@@ -186,11 +218,31 @@ static bool update_encoder() {
         return true;
     }
 
-    // Shortest-path delta, handling the 0/4095 wraparound boundary.
+    // Resolve the 0/4095 wraparound. Below RPM_ALIAS_FWD_MIN_MPH direction is genuinely
+    // ambiguous (cogging / real reverse), so take the blind shortest path. Above it we're
+    // confidently rolling forward (a NEGATIVE count step here — see the -delta in the velocity
+    // calc below); snap the raw delta to the whole-rev offset nearest the step our last fused
+    // speed predicts, which de-aliases a >½-rev forward wrap (encoder aliases above ~7 mph)
+    // without inventing motion from a small noise blip.
     int delta = angle - _encLastAngle;
-    if (delta >  2048) delta -= AS5600_COUNTS_PER_REV;
-    if (delta < -2048) delta += AS5600_COUNTS_PER_REV;
+    if (_rpmData.fusedSpeedMph > RPM_ALIAS_FWD_MIN_MPH) {
+        float expected = -_rpmData.fusedSpeedMph * dt / (RPM_CM_PER_COUNT * 0.0223694f);
+        while (delta - expected >  2048) delta -= AS5600_COUNTS_PER_REV;
+        while (delta - expected < -2048) delta += AS5600_COUNTS_PER_REV;
+    } else {
+        if (delta >  2048) delta -= AS5600_COUNTS_PER_REV;
+        if (delta < -2048) delta += AS5600_COUNTS_PER_REV;
+    }
     _encLastAngle = angle;
+
+    // Cumulative signed count for distance calibration — sums the shortest-path delta, so it
+    // stays honest through slow-push jitter. Valid only below the ~7 mph alias limit (>½ rev per
+    // 4 ms poll aliases); the calibration push must stay well under that.
+    _rpmData.encCounts += delta;
+
+    // Odometry source of truth: signed distance (forward = -delta, matching the velocity calc),
+    // so reverse subtracts and small moves the coarse hall pulse count can't resolve still register.
+    _rpmData.odometryCm += (float)(-delta) * RPM_CM_PER_COUNT;
 
     // EMA encoder velocity in mph — forward positive, backward negative. Divides by
     // the gate's measured dt, not the nominal interval: loop stalls (IMU drains) can
@@ -205,6 +257,11 @@ static bool update_encoder() {
     if (!isnan(fused2EncR)) {
         _fused2Kf.correct(rawVelMph, fused2EncR);
         _rpmData.fusedSpeedMph = _fused2Kf.angle;
+    }
+    float fused2EncRNoImu = fused_enc_r(_fused2KfNoImu.angle);  // no-IMU twin, gated on its own estimate
+    if (!isnan(fused2EncRNoImu)) {
+        _fused2KfNoImu.correct(rawVelMph, fused2EncRNoImu);
+        _rpmData.fusedNoImuMph = _fused2KfNoImu.angle;
     }
 
     // Push delta into circular buffer.
@@ -270,14 +327,13 @@ static bool update_encoder() {
 // Private helpers — hall-effect
 // =============================================================================
 
-// Reads latest hall-effect ISR state, updates EMA speed, and accumulates odometry. Called every loop.
+// Reads latest hall-effect ISR state, updates speed, and accumulates odometry. Called every loop.
 static void update_hall() {
     // Snapshot volatile state atomically before processing.
     uint32_t lastPulseUs = _hallLastPulseUs;
     uint32_t periodUs    = _hallPeriodUs;
     uint32_t pulseCount  = _hallPulseCount;
 
-    // Odometry: count new pulses since last call; skip accumulation during cogging.
     uint32_t newPulses    = pulseCount - _hallLastCountTracked;
     _hallLastCountTracked = pulseCount;
 
@@ -285,15 +341,11 @@ static void update_hall() {
     // decays to 0 at standstill instead of freezing at its last value.
     _hallHz.update(newPulses);
     _rpmData.hallHz = _hallHz.hz;
-    if (!_rpmData.cogging)
-        _rpmData.odometryCm += (float)newPulses * RPM_HALL_CM_PER_PULSE;
     _rpmData.timestamp = millis();
 
     bool stale = (micros() - lastPulseUs) > (RPM_STALE_MS * 1000UL);
 
     if (_rpmData.cogging || stale || periodUs == 0) {
-        _hallEmaSpeed    = 0.0f;
-        _hallSpikeStreak = 0;
         _rpmData.hallRawMph   = 0.0f;
         _rpmData.hallSpeedMph = 0.0f;
         // Hall silence above the encoder ramp is a measurement (≈0 mph) — without it
@@ -303,38 +355,50 @@ static void update_hall() {
             _fused2Kf.correct(0.0f, rtConfig.fusedHallR);
             _rpmData.fusedSpeedMph = _fused2Kf.angle;
         }
+        if (fabsf(_fused2KfNoImu.angle) > rtConfig.fusedRampStartMph) {  // no-IMU twin
+            _fused2KfNoImu.correct(0.0f, rtConfig.fusedHallR);
+            _rpmData.fusedNoImuMph = _fused2KfNoImu.angle;
+        }
         return;
     }
 
-    // Only process speed update when a new pulse has arrived — applying EMA every loop
-    // against an unchanged periodUs would converge instantly and provide no smoothing.
+    // Only process the speed update when a new pulse has arrived — periodUs is unchanged otherwise.
     if (newPulses == 0) return;
 
     float periodS  = periodUs / 1000000.0f;
     float motorRpm = (60.0f / periodS) / RPM_PULSES_PER_REV;
     float rawSpeed = motorRpm * RPM_HALL_SPEED_FACTOR;
 
-    // Reject noise pulses that produce an implausibly large speed jump.
-    // Force-accept after RPM_SPIKE_MAX_STREAK consecutive rejections so genuine acceleration isn't blocked.
-    bool spike = (_hallEmaSpeed > 0.0f &&
-                  rawSpeed > _rpmData.hallSpeedMph * RPM_SPIKE_REJECT_FACTOR &&
-                  _hallSpikeStreak < RPM_SPIKE_MAX_STREAK);
-    if (spike) {
-        ESP_LOGW(TAG, "⚠️ hall spike rejected: raw=%.2f mph  filtered=%.2f mph  streak=%d",
-                 rawSpeed, _rpmData.hallSpeedMph, _hallSpikeStreak + 1);
-        _hallSpikeStreak++;
+    // Physical-plausibility gate: reject a reading whose implied acceleration exceeds the car's
+    // max — a double-count/glitch gives a short period and thus an impossible |Δspeed/Δt|. Judged
+    // against the last accepted reading, so it self-corrects after a rejected pulse. (A more
+    // sophisticated version could scale the limit by the measured IMU forward accel.)
+    float accelDt = (lastPulseUs - _hallAccelLastUs) / 1000000.0f;
+    if (_hallAccelLastUs != 0 && accelDt > 0.0f &&
+        fabsf(rawSpeed - _hallAccelLastMph) / accelDt > RPM_HALL_MAX_ACCEL_MPH_S) {
+        static uint32_t _lastAccelRejMs = 0;
+        if (millis() - _lastAccelRejMs >= 1000) {
+            _lastAccelRejMs = millis();
+            ESP_LOGW(TAG, "⚠️ hall reading rejected (impossible accel): raw=%.2f last=%.2f dt=%.3fs → %.0f mph/s",
+                     rawSpeed, _hallAccelLastMph, accelDt, fabsf(rawSpeed - _hallAccelLastMph) / accelDt);
+        }
         return;
     }
+    _hallAccelLastMph = rawSpeed;
+    _hallAccelLastUs  = lastPulseUs;
+    _rpmData.hallPulses += newPulses;  // count only accel-accepted pulses (dashboard tick markers)
 
-    _hallEmaSpeed    += RPM_EMA_ALPHA * (rawSpeed - _hallEmaSpeed);
-    _hallSpikeStreak  = 0;
+    // Speed channel: raw per-pulse speed, unsmoothed and never phantom-gated. Under-reporting
+    // speed makes the throttle PID over-command (unintended acceleration), so speed fails high —
+    // the ISR debounce already dropped physically-impossible edges.
     _rpmData.hallRawMph   = rawSpeed;
-    _rpmData.hallSpeedMph = _hallEmaSpeed;
+    _rpmData.hallSpeedMph = rawSpeed;
 
-    // Fused-speed hall correction per accepted pulse — raw speed, not the EMA:
-    // the KF smooths on its own, and double-filtering would lag the high-speed input.
+    // Fused-speed hall correction per debounced pulse; the KF does its own smoothing.
     _fused2Kf.correct(rawSpeed, rtConfig.fusedHallR);
     _rpmData.fusedSpeedMph = _fused2Kf.angle;
+    _fused2KfNoImu.correct(rawSpeed, rtConfig.fusedHallR);  // no-IMU twin
+    _rpmData.fusedNoImuMph = _fused2KfNoImu.angle;
 }
 
 // =============================================================================
@@ -352,9 +416,12 @@ void rpm_init() {
     Wire.beginTransmission(AS5600_ADDR);
     if (Wire.endTransmission() != 0) {
         Serial.printf("[%s] ❌ AS5600 not found at 0x%02X — check wiring\n", TAG, AS5600_ADDR);
+        _rpmData.encoderHealthy = false;
+        log_event(LOG_WARN, "encoder not found — odom unguarded");
     } else {
         Serial.printf("[%s] ✅ AS5600 encoder ready at 0x%02X (cogging detection)\n", TAG, AS5600_ADDR);
         check_magnet_status();
+        _rpmData.encoderHealthy = (read_magnet_detected() == 1);
     }
 }
 
@@ -364,15 +431,47 @@ bool rpm_update(float fwdAccelMps2) {
     // 2-state predict before corrections: integrate bias-corrected forward accel
     // (m/s² → mph/s) at the 50 Hz accel-report cadence.
     float dt2;
-    if (_fused2PredictGate.tick(dt2) && isfinite(fwdAccelMps2)) {
-        _fused2Kf.predict(fwdAccelMps2 * 2.23694f, dt2, rtConfig.fused2QSpeed, rtConfig.fused2QBias);
-        _rpmData.fusedSpeedMph = _fused2Kf.angle;
+    if (_fused2PredictGate.tick(dt2)) {
+        if (isfinite(fwdAccelMps2)) {
+            _fused2Kf.predict(fwdAccelMps2 * 2.23694f, dt2, rtConfig.fused2QSpeed, rtConfig.fused2QBias);
+            _rpmData.fusedSpeedMph = _fused2Kf.angle;
+        }
+        // No-IMU twin: same predict cadence but 0 accel (constant-velocity model).
+        _fused2KfNoImu.predict(0.0f, dt2, rtConfig.fused2QSpeed, rtConfig.fused2QBias);
+        _rpmData.fusedNoImuMph = _fused2KfNoImu.angle;
     }
 
     // True when a fresh AS5600 angle was read this call (poll gate fired and the I2C
     // read succeeded) — main.cpp counts these to report the encoder sample rate.
     bool encSampled = update_encoder();
     update_hall();
+
+    // Size the ISR debounce window from the current fused speed: a fraction of the real pulse
+    // period at that speed, clamped. Wide at rest (a fast repeat is bounce), tight at speed (never
+    // drop the closely-spaced next real pulse). Published to the volatile the ISR reads.
+    float v = fabsf(_fused2Kf.angle);
+    uint32_t win = (uint32_t)rtConfig.debounceMaxUs;
+    if (v > 0.01f) {
+        float periodUs = 60.0e6f * RPM_HALL_SPEED_FACTOR / (v * RPM_PULSES_PER_REV);
+        float w = rtConfig.debounceSpeedFactor * periodUs;
+        win = (uint32_t)fminf(fmaxf(w, rtConfig.debounceMinUs), rtConfig.debounceMaxUs);
+    }
+    _hallDebounceUs = win;
+
+    // Encoder-health transitions as events. The enc_fault telemetry flag carries the steady
+    // state; this flags the moment it flips (e.g. a magnet lost mid-drive), once each way.
+    // First call seeds from the boot state so a boot-time absence isn't double-reported
+    // (rpm_init already emitted it).
+    static bool _encHealthSeen = false;
+    static bool _encHealthInit = false;
+    if (!_encHealthInit) {
+        _encHealthSeen = _rpmData.encoderHealthy;
+        _encHealthInit = true;
+    } else if (_rpmData.encoderHealthy != _encHealthSeen) {
+        _encHealthSeen = _rpmData.encoderHealthy;
+        if (_rpmData.encoderHealthy) log_event(LOG_WARN,  "encoder recovered");
+        else                         log_event(LOG_ERROR, "encoder fault — odom unguarded");
+    }
 
     static uint32_t lastLogMs = 0;
     uint32_t now = millis();

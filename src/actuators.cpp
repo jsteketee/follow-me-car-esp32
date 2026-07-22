@@ -15,6 +15,11 @@ static Servo escServo;
 static Servo steerServo;
 static float _smoothThrottle = 0.0f;
 
+// Last PWM µs actually written to each servo, exposed for telemetry so the Pi/dashboard
+// can see the post-deadband/scale/smoothing output — one stage past control's normalized effort.
+static int _escPwmUs   = PWM_NEUTRAL_US;
+static int _steerPwmUs = PWM_NEUTRAL_US;
+
 // Maps a [-1, 1] normalized value to a PWM microsecond value centered on neutral.
 static int float_to_pwm(float val) {
     return (int)(PWM_NEUTRAL_US + constrain(val, -1.0f, 1.0f) * 500.0f);
@@ -57,14 +62,12 @@ void actuators_set(float throttle, float steering) {
     float scaledSteering = constrain(steering * rtConfig.steeringMax + rtConfig.steeringTrim, -1.0f, 1.0f);
 
     // Convert and write PWM to both servos.
-    int escPwm = constrain(float_to_pwm(scaledThrottle), PWM_MIN_US, PWM_MAX_US);
-    escServo.writeMicroseconds(escPwm);
-    steerServo.writeMicroseconds(constrain(float_to_pwm(scaledSteering), PWM_MIN_US, PWM_MAX_US));
-
-    static uint32_t lastLogMs = 0;
-    uint32_t now = millis();
-    if (now - lastLogMs >= 1000) {
-        lastLogMs = now;
-        ESP_LOGI(TAG, "throttle=%.0f%%  pwm=%dµs", throttle * 100.0f, escPwm);
-    }
+    _escPwmUs   = constrain(float_to_pwm(scaledThrottle), PWM_MIN_US, PWM_MAX_US);
+    _steerPwmUs = constrain(float_to_pwm(scaledSteering), PWM_MIN_US, PWM_MAX_US);
+    escServo.writeMicroseconds(_escPwmUs);
+    steerServo.writeMicroseconds(_steerPwmUs);
 }
+
+// Last PWM µs written to the ESC (throttle) and steering servo.
+int actuators_get_esc_pwm()   { return _escPwmUs; }
+int actuators_get_steer_pwm() { return _steerPwmUs; }
